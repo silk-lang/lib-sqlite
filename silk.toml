@@ -1,0 +1,34 @@
+[package]
+name = "db-sqlite"
+description = "SQLite bindings with prepared statements and transactions, built from the pinned amalgamation"
+repository = "https://github.com/silk-lang/lib-sqlite"
+readme = "README.md"
+version = "0.1.0"
+silk-version = "0.1.0-dev.61+91f335268900"
+kind = "library"
+exports = ["sqlite", "sys"]
+
+# SQLite's amalgamation (one C file) is fetched from sqlite.org, pinned by hash, and compiled into
+# every executable that depends on this package, together with the small shim in native/. On
+# Windows it needs the Windows SDK, which Silk does not pass to Clang, so scripts/prepare-windows.ps1
+# builds both into silksqlite.lib and names that directory, with the
+# CRT import libraries a `library` entry does not reach, as this archive's override.
+[native]
+sources = [
+  { c = "sqlite:sqlite3.c", flags = ["-O2", "-w", "-DSQLITE_DQS=0", "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1", "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS", "-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_OMIT_SHARED_CACHE", "-DSQLITE_USE_ALLOCA", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_MATH_FUNCTIONS", "-DSQLITE_ENABLE_RTREE", "-DSQLITE_ENABLE_SESSION", "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_COLUMN_METADATA"], os = ["macos", "linux"] },
+  { c = "native/shim.c", include = ["sqlite:"], flags = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"], os = ["macos", "linux"] },
+]
+link = [
+  { library = "m", mode = "dynamic", os = "linux" },
+  { library = "pthread", mode = "dynamic", os = "linux" },
+  { library = "dl", mode = "dynamic", os = "linux" },
+  { static-archive = "sqlite:silksqlite.lib", os = "windows" },
+  { static-archive = "sqlite:kernel32.lib", os = "windows" },
+  { static-archive = "sqlite:ucrt.lib", os = "windows" },
+  { static-archive = "sqlite:vcruntime.lib", os = "windows" },
+]
+
+[native.archive.sqlite]
+url = "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
+sha256 = "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e"
+strip = 1

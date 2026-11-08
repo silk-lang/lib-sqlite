@@ -1,0 +1,101 @@
+name: SQLite
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sqlite-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025-vs2026]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Silk on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^silk-version = "\([^"]*\)"/\1/p' silk.toml)
+          test -n "$version"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://raw.githubusercontent.com/silk-lang/silk/v${version}/install.sh" \
+            -o "$RUNNER_TEMP/install-silk.sh"
+          SILK_RELEASE="v$version" sh "$RUNNER_TEMP/install-silk.sh"
+          echo "$HOME/.silk/bin" >> "$GITHUB_PATH"
+      - name: Select Linux Clang
+        if: runner.os == 'Linux'
+        shell: bash
+        run: echo "SILK_CLANG=$(command -v clang-22)" >> "$GITHUB_ENV"
+      - name: Select macOS Clang and SDK
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          echo "SILK_CLANG=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Configure Windows SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ tools not found.' }
+          & "$vs/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          foreach ($name in @('INCLUDE', 'LIB', 'LIBPATH', 'PATH')) {
+            "$name=$([Environment]::GetEnvironmentVariable($name))" >> $env:GITHUB_ENV
+          }
+      - name: Install Windows LLVM 22
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pin = (Get-Content toolchains.lock.json -Raw | ConvertFrom-Json).llvm.windows
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm.tar.xz'
+          Invoke-WebRequest $pin.url -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) {
+            throw 'LLVM archive SHA-256 mismatch.'
+          }
+          $directory = Join-Path $env:RUNNER_TEMP 'llvm'
+          New-Item -ItemType Directory -Force $directory | Out-Null
+          tar -xf $archive -C $directory --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed.' }
+          "SILK_CLANG=$directory/bin/clang.exe" >> $env:GITHUB_ENV
+      - name: Install Silk on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $pin = Select-String -Path silk.toml -Pattern '^silk-version = "([^"]+)"'
+          if (-not $pin) { throw 'Missing Silk version pin.' }
+          $version = $pin.Matches[0].Groups[1].Value
+          $installer = Join-Path $env:RUNNER_TEMP 'install-silk.ps1'
+          Invoke-WebRequest "https://raw.githubusercontent.com/silk-lang/silk/v$version/install.ps1" -OutFile $installer
+          $env:SILK_RELEASE = "v$version"
+          & $installer
+          "$HOME/.silk/bin" >> $env:GITHUB_PATH
+      - name: Prepare Windows SQLite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-windows.ps1
+      - run: silk use
+      - run: silk format --check
+      - run: silk check
+      - run: silk test --root src/tests.silk
+      - run: silk build
+      - run: silk doc -o build/doc.json

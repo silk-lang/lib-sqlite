@@ -1,0 +1,531 @@
+//! SQLite tests: values round trip, statement reuse, errors, transactions and files.
+import sqlite { Connection, OpenMode, SqliteError, Statement, TransactionKind, Value, ValueType }
+import sqlite as sql
+import silk.core.effect { Effect }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.filesystem_machine { MachineFileSystem }
+import silk.collections.bytes { Bytes }
+import silk.core.result { Result }
+import silk.text.string { InvalidUtf8, String }
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  import silk.platform.windows.host_input { WindowsHostInput }
+  import silk.platform.windows.path { WindowsPath }
+  import silk.system.host_input { HostInput, HostInputError }
+}
+
+import silk.testing.testing { AssertionError, Testing }
+
+fn stringEquals(left: string, right: string) -> bool {
+  return left == right
+}
+
+type Failures = AssertionError<'static> | SqliteError | OutOfMemoryError
+
+effect fn errorCode(error: SqliteError) -> i32 {
+  return error.code
+}
+
+// The extended result code `body` fails with, or 0 when it succeeds.
+effect fn outcome(connection: &Connection, sqlText: string) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<SqliteError>(attemptExecute(&connection, sqlText), errorCode)
+}
+
+effect fn attemptExecute(connection: &Connection, sqlText: string) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  run connection.execute(sqlText)
+  return 0
+}
+
+effect fn attemptPrepare(connection: &Connection, sqlText: string) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run connection.prepare(sqlText)
+  return 0
+}
+
+effect fn prepareOutcome(connection: &Connection, sqlText: string) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<SqliteError>(attemptPrepare(&connection, sqlText), errorCode)
+}
+
+effect fn attemptBind(statement: &mut Statement, index: usize) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  run statement.bindInt(index, 1)
+  return 0
+}
+
+effect fn attemptInsert(statement: &mut Statement, id: i64) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  run statement.bindInt(1, id)
+  drop run statement.execute()
+  return 0
+}
+
+effect fn count(connection: &Connection, table: string) -> i64
+  ! Failures
+  ? &mut Allocator {
+  let mut text = run String.copy("SELECT count(*) FROM ")
+  run text.append(table)
+  let mut statement = run connection.prepare(text.view())
+  run Testing.expect(run statement.step(), "count returns a row")
+  return statement.columnInt(0)
+}
+
+effect fn valuesRoundTrip() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  run db.execute("CREATE TABLE t (i INTEGER, r REAL, s TEXT, b BLOB, n);")
+  let mut insert = run db.prepare("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)")
+  run Testing.expect(insert.parameterCount() == 5, "five parameters")
+  run Testing.expect(!insert.isReadOnly(), "an insert writes")
+  run insert.bindInt(1, -9007199254740993)
+  run insert.bindFloat(2, 2.5)
+  run insert.bindText(3, "héllo, wörld")
+  run insert.bindBlob(4, b"a\0b\xff")
+  run insert.bindNull(5)
+  run Testing.expect((run insert.execute()) == 1, "one row inserted")
+  run Testing.expect(db.lastInsertRowId() == 1, "the first rowid is 1")
+
+  // Empty text and blobs are values, not NULL.
+  run insert.bindText(3, "")
+  run insert.bindBlob(4, b"")
+  drop run insert.execute()
+
+  let mut query = run db.prepare("SELECT i, r, s, b, n AS absent FROM t ORDER BY rowid")
+  run Testing.expect(query.isReadOnly(), "a select only reads")
+  run Testing.expect(query.columnCount() == 5, "five columns")
+  run Testing.expect(stringEquals(query.columnName(4), "absent"), "aliases name columns")
+  run Testing.expect(stringEquals(query.columnName(0), "i"), "columns are named")
+  run Testing.expect(run query.step(), "the first row")
+  run Testing.expect(query.columnType(0).same(ValueType.Integer), "integer type")
+  run Testing.expect(query.columnInt(0) == -9007199254740993, "64-bit integers round trip")
+  run Testing.expect(query.columnType(1).same(ValueType.Real), "real type")
+  run Testing.expect(query.columnFloat(1) == 2.5, "reals round trip")
+  run Testing.expect(
+    stringEquals(run query.columnText(2), "héllo, wörld"),
+    "UTF-8 text round trips",
+  )
+  let blob = query.columnBlob(3)
+  run Testing.expect(
+    blob.length == 4 && blob[1] == 0 && blob[3] == 255,
+    "blobs keep NUL and high bytes",
+  )
+  run Testing.expect(
+    query.columnIsNull(4) && query.columnType(4).same(ValueType.Null),
+    "NULL is NULL",
+  )
+  run Testing.expect(run query.step(), "the second row")
+  run Testing.expect(query.columnType(2).same(ValueType.Text), "empty text is text")
+  run Testing.expect(query.columnType(3).same(ValueType.Blob), "an empty blob is a blob")
+  run Testing.expect(query.columnBlob(3).length == 0, "the empty blob is empty")
+  run Testing.expect(!(run query.step()), "two rows")
+
+  let mut generic = run db.prepare("SELECT i, r, s, b, n FROM t WHERE rowid = 1")
+  run Testing.expect(run generic.step(), "a row to copy")
+  let integer = run generic.columnValue(0)
+  run Testing.expect(
+    match &integer {
+      Value.Integer { value } => value == -9007199254740993
+      _ => false
+    },
+    "integer value",
+  )
+  let text = run generic.columnValue(2)
+  run Testing.expect(
+    match &text {
+      Value.Text { value } => stringEquals(value.view(), "héllo, wörld")
+      _ => false
+    },
+    "text value",
+  )
+  let bytes = run generic.columnValue(3)
+  run Testing.expect(
+    match &bytes {
+      Value.Blob { value } => value.length() == 4
+      _ => false
+    },
+    "blob value",
+  )
+  let nothing = run generic.columnValue(4)
+  run Testing.expect(
+    match &nothing {
+      Value.Null => true
+      _ => false
+    },
+    "null value",
+  )
+
+  let mut echo = run db.prepare("SELECT ?1, typeof(?1)")
+  run echo.bindValue(1, &text)
+  run Testing.expect(run echo.step(), "echo row")
+  run Testing.expect(stringEquals(run echo.columnText(1), "text"), "bindValue keeps the type")
+}
+
+effect fn statementsAreReused() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  run db.execute(
+    "CREATE TABLE nodes (id INTEGER PRIMARY KEY, refs INTEGER NOT NULL, data BLOB NOT NULL);\n-- a comment\nCREATE INDEX nodes_refs ON nodes (refs);\n",
+  )
+  let mut insert = run db.prepare("INSERT INTO nodes (refs, data) VALUES (:refs, :data)")
+  let refs = (run insert.parameterIndex(":refs")).unwrapOr(0)
+  let data = (run insert.parameterIndex(":data")).unwrapOr(0)
+  run Testing.expect(refs == 1 && data == 2, "named parameters have indices")
+  run Testing.expect((run insert.parameterIndex(":missing")).isNone(), "unknown names have none")
+  let mut i: i64 = 0
+  while i < 100 {
+    run insert.bindInt(refs, i)
+    run insert.bindBlob(data, b"node")
+    drop run insert.execute()
+    i = i + 1
+  }
+  run Testing.expect(db.lastInsertRowId() == 100, "a hundred rows")
+  let mut update = run db.prepare("UPDATE nodes SET refs = refs + 1 WHERE refs >= ?")
+  run update.bindInt(1, 50)
+  run Testing.expect((run update.execute()) == 50, "execute returns changed rows")
+  run Testing.expect(db.changes() == 50, "changes matches")
+  let mut sum = run db.prepare("SELECT sum(refs) FROM nodes WHERE refs < ?")
+  run sum.bindInt(1, 10)
+  run Testing.expect(run sum.step(), "sum row")
+  run Testing.expect(sum.columnInt(0) == 45, "sum below 10")
+  sum.reset()
+  run sum.bindInt(1, 1000)
+  run Testing.expect(run sum.step(), "sum row again")
+  run Testing.expect(sum.columnInt(0) == 4950 + 50, "sum of all after reset and rebind")
+  sum.reset()
+  sum.clearBindings()
+  run Testing.expect(run sum.step(), "sum with NULL bound")
+  run Testing.expect(sum.columnIsNull(0), "nothing is below NULL")
+}
+
+effect fn errorsCarryCodes() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  run Testing.expect((run outcome(&db, "SELEC 1")) == sql.ERROR, "syntax errors are SQLITE_ERROR")
+  run Testing.expect(
+    (run outcome(&db, "SELECT * FROM missing")) == sql.ERROR,
+    "missing tables fail",
+  )
+  run db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL)")
+  run db.execute("INSERT INTO u (name) VALUES ('a')")
+  run Testing.expect(
+    (run outcome(&db, "INSERT INTO u (name) VALUES ('a')")) == 2067,
+    "unique violations are SQLITE_CONSTRAINT_UNIQUE",
+  )
+  run Testing.expect(
+    (run outcome(&db, "INSERT INTO u (name) VALUES (NULL)")) == 1299,
+    "NOT NULL violations are SQLITE_CONSTRAINT_NOTNULL",
+  )
+  run Testing.expect(
+    (run prepareOutcome(&db, "SELECT 1; SELECT 2")) == sql.MISUSE,
+    "prepare takes one statement",
+  )
+  run Testing.expect(
+    (run prepareOutcome(&db, "SELECT 1;  \n")) == 0,
+    "a trailing semicolon is fine",
+  )
+  run Testing.expect(
+    (run prepareOutcome(&db, "  -- nothing")) == sql.MISUSE,
+    "prepare needs a statement",
+  )
+  run Testing.expect((run prepareOutcome(&db, "")) == sql.MISUSE, "empty SQL is no statement")
+
+  let mut insert = run db.prepare("INSERT INTO u (id, name) VALUES (?, 'b')")
+  run Testing.expect(
+    (run Effect.catch<SqliteError>(attemptBind(&mut insert, 3), errorCode)) == sql.RANGE,
+    "binding past the parameters is SQLITE_RANGE",
+  )
+  run Testing.expect(
+    (run Effect.catch<SqliteError>(attemptInsert(&mut insert, 1), errorCode)) == 1555,
+    "duplicate primary keys are SQLITE_CONSTRAINT_PRIMARYKEY",
+  )
+  run Testing.expect(
+    (run Effect.catch<SqliteError>(attemptInsert(&mut insert, 2), errorCode)) == 0,
+    "a failed statement can run again",
+  )
+  run Testing.expect((run count(&db, "u")) == 2, "only the good insert landed")
+
+  let error = SqliteError { code: 2067, message: String.make() }
+  run Testing.expect(
+    error.primary() == sql.CONSTRAINT && error.isConstraint() && !error.isBusy(),
+    "primary codes",
+  )
+}
+
+effect fn messageOf(error: SqliteError) -> bool {
+  return String.contains(error.message.view(), "syntax error")
+}
+
+effect fn attemptMessage(connection: &Connection) -> bool
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  run connection.execute("SELEC 1")
+  return false
+}
+
+effect fn errorsCarryMessages() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  run Testing.expect(
+    run Effect.catch<SqliteError>(attemptMessage(&db), messageOf),
+    "the message comes from SQLite",
+  )
+}
+
+effect fn insertInTransaction(db: &Connection, kind: TransactionKind, commit: bool) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut transaction = run db.begin(kind)
+  run Testing.expect(!db.isAutocommit(), "a transaction is open")
+  run transaction.on().execute("INSERT INTO log VALUES ('entry')")
+  if commit {
+    run transaction.commit()
+  }
+}
+
+effect fn transactions() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  run db.execute("CREATE TABLE log (entry TEXT)")
+  run Testing.expect(db.isAutocommit(), "no transaction at first")
+  run insertInTransaction(&db, TransactionKind.Immediate, false)
+  run Testing.expect(db.isAutocommit(), "dropping the transaction ended it")
+  run Testing.expect((run count(&db, "log")) == 0, "dropping without commit rolls back")
+  run insertInTransaction(&db, TransactionKind.Deferred, true)
+  run Testing.expect((run count(&db, "log")) == 1, "commit keeps the change")
+  run insertInTransaction(&db, TransactionKind.Exclusive, true)
+  run Testing.expect((run count(&db, "log")) == 2, "exclusive transactions commit")
+
+  let mut outer = run db.begin(TransactionKind.Deferred)
+  run Testing.expect((run outcome(&db, "BEGIN")) == sql.ERROR, "transactions do not nest")
+  run db.execute("INSERT INTO log VALUES ('rolled back')")
+  run outer.rollback()
+  run Testing.expect(db.isAutocommit(), "rollback ends the transaction")
+  run Testing.expect((run count(&db, "log")) == 2, "rollback discards the change")
+}
+
+effect fn prepareAndClose() -> Statement
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openMemory()
+  return run db.prepare("SELECT 40 + 2")
+}
+
+effect fn statementOutlivesConnection() -> ()
+  ! Failures
+  ? &mut Allocator {
+  let mut statement = run prepareAndClose()
+  run Testing.expect(run statement.step(), "the statement still runs")
+  run Testing.expect(statement.columnInt(0) == 42, "and returns its row")
+  run Testing.expect(stringEquals(statement.sql(), "SELECT 40 + 2"), "sql returns the source")
+}
+
+effect fn library() -> ()
+  ! Failures
+  ? &mut Allocator {
+  run Testing.expect(sql.versionNumber() >= 3054001, "SQLite 3.54.1 or later")
+  let version = run sql.version()
+  run Testing.expect(String.startsWith(version.view(), "3."), "the version is text")
+  let db = run Connection.openMemory()
+  let mut features = run db.prepare("SELECT json_extract('{\"a\": [1, 2]}', '$.a[1]'), sqrt(16.0)")
+  run Testing.expect(run features.step(), "a feature row")
+  run Testing.expect(
+    features.columnInt(0) == 2 && features.columnFloat(1) == 4.0,
+    "JSON and math functions are built in",
+  )
+  run db.execute("CREATE VIRTUAL TABLE docs USING fts5(body)")
+  run db.execute("INSERT INTO docs VALUES ('the quick brown fox'), ('lazy dogs')")
+  let mut search = run db.prepare("SELECT count(*) FROM docs WHERE docs MATCH 'quick'")
+  run Testing.expect((run search.step()) && search.columnInt(0) == 1, "FTS5 is built in")
+}
+
+effect fn readOnlyWrite(path: string) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<SqliteError>(attemptReadOnlyWrite(path), errorCode)
+}
+
+effect fn attemptReadOnlyWrite(path: string) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  let db = run Connection.openWith(path, OpenMode.ReadOnly)
+  run db.execute("INSERT INTO kv VALUES ('c', 3)")
+  return 0
+}
+
+effect fn openMissing(path: string) -> i32
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run Effect.catch<SqliteError>(attemptOpen(path), errorCode)
+}
+
+effect fn attemptOpen(path: string) -> i32
+  ! SqliteError | OutOfMemoryError
+  ? &mut Allocator {
+  drop run Connection.openWith(path, OpenMode.ReadWrite)
+  return 0
+}
+
+effect fn files(directory: &Path) -> ()
+  ! Failures | FileError
+  ? &mut Allocator {
+  let file = run Path.joinUtf8(&directory, b"test.db")
+  let native = run nativeText(&file)
+  let path = native.view()
+  run create(path)
+  run reopen(path)
+  run Testing.expect(
+    (run readOnlyWrite(path)) == sql.READONLY,
+    "read-only connections refuse writes",
+  )
+  let missing = run Path.joinUtf8(&directory, b"missing.db")
+  let missingNative = run nativeText(&missing)
+  run Testing.expect(
+    (run openMissing(missingNative.view())) == sql.CANTOPEN,
+    "ReadWrite does not create files",
+  )
+  run concurrent(path)
+}
+
+effect fn create(path: string) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.open(path)
+  run db.execute(
+    "PRAGMA journal_mode = WAL; CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) STRICT;",
+  )
+  run db.execute("INSERT INTO kv VALUES ('a', 1), ('b', 2)")
+}
+
+effect fn reopen(path: string) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let db = run Connection.openWith(path, OpenMode.ReadOnly)
+  run Testing.expect((run count(&db, "kv")) == 2, "rows persist after closing")
+}
+
+effect fn concurrent(path: string) -> ()
+  ! Failures
+  ? &mut Allocator {
+  let writer = run Connection.open(path)
+  let reader = run Connection.open(path)
+  let mut transaction = run writer.begin(TransactionKind.Immediate)
+  run Testing.expect(
+    (run outcome(&reader, "BEGIN IMMEDIATE")) == sql.BUSY,
+    "a second writer is busy",
+  )
+  run Testing.expect((run count(&reader, "kv")) == 2, "WAL readers read during a write")
+  run transaction.commit()
+  reader.busyTimeout(1000)
+}
+
+effect fn withTemporaryDirectory() -> ()
+  ! Failures | FileError
+  ? &mut Allocator {
+  let mut machine = run MachineFileSystem.make()
+  let parent = run temporaryRoot()
+  let temporary = run FileSystem.temporaryDirectory(&parent, "silk-sqlite-")
+    |> Effect.provideMut<FileSystem>(&mut machine)
+  run files(&temporary.path)
+  run FileSystem.release(move temporary) |> Effect.provideMut<FileSystem>(&mut machine)
+}
+
+// A directory for scratch files: /tmp, or the working directory on Windows.
+effect fn temporaryRoot() -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let mut inputs = run Effect.catch<HostInputError>(WindowsHostInput.capture(), hostFailure)
+    let cwd = run Effect.catch<HostInputError>(
+      HostInput.workingDirectory() |> Effect.provideMut<HostInput>(&mut inputs),
+      hostFailure,
+    )
+    return run WindowsPath.fromNativeBytes(Bytes.asSlice(&cwd))
+  } else {
+    return run Path.make("/tmp")
+  }
+}
+
+// `path` as the operating system spells it, which is what SQLite opens.
+effect fn nativeText(path: &Path) -> String
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() == "windows" {
+    let bytes = run WindowsPath.toNativeBytes(path)
+    return match String.fromBytes(move bytes) {
+      Result<String, InvalidUtf8>.Success { value } => move value
+      Result<String, InvalidUtf8>.Failure { error: _invalid } => String.make()
+    }
+  } else {
+    return run String.copy(Path.view(path).unwrapOr(""))
+  }
+}
+
+static if Intrinsic.targetOperatingSystem() == "windows" {
+  effect fn hostFailure(error: HostInputError) -> never
+    ! FileError {
+    drop error
+    fail FileSystem.error(FileSystem.pathOperation(), FileSystem.other())
+  }
+}
+
+test effect fn valuesRoundTripTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run valuesRoundTrip() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn statementsAreReusedTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run statementsAreReused() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn errorsCarryCodesTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run errorsCarryCodes() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn errorsCarryMessagesTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run errorsCarryMessages() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn transactionsTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run transactions() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn statementOutlivesConnectionTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run statementOutlivesConnection() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn libraryTest() -> ()
+  ! Failures {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run library() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn withTemporaryDirectoryTest() -> ()
+  ! Failures | FileError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run withTemporaryDirectory() |> Effect.provideMut<Allocator>(&mut allocator)
+}

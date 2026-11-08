@@ -1,0 +1,429 @@
+//! The raw SQLite C API that `sqlite` calls, plus the helpers of `native/shim.c`.
+//!
+//! Every function is unsafe: pointer validity, string lengths and handle lifetimes are the
+//! caller's obligations. A database handle (`sqlite3 *`) and a statement handle
+//! (`sqlite3_stmt *`) are both `?*mut u8` here. Prefer the safe API in `sqlite`.
+//!
+//! Calls that can run a callback registered earlier on the same thread (a user function, an
+//! authorizer, a destructor) are marked `@invokesDeferredCallbacks`, so a caller can register
+//! Silk callbacks with `sqlite3_create_function_v2`, `sqlite3_set_authorizer` and the rest.
+//! The package is built with the session extension, column metadata and extension loading.
+
+pub const SQLITE_OK: i32 = 0
+
+pub const SQLITE_ROW: i32 = 100
+
+pub const SQLITE_DONE: i32 = 101
+
+pub const SQLITE_INTEGER: i32 = 1
+
+pub const SQLITE_FLOAT: i32 = 2
+
+pub const SQLITE_TEXT: i32 = 3
+
+pub const SQLITE_BLOB: i32 = 4
+
+pub const SQLITE_NULL: i32 = 5
+
+pub const SQLITE_OPEN_READONLY: i32 = 1
+
+pub const SQLITE_OPEN_READWRITE: i32 = 2
+
+pub const SQLITE_OPEN_CREATE: i32 = 4
+
+pub const SQLITE_OPEN_URI: i32 = 64
+
+pub const SQLITE_OPEN_MEMORY: i32 = 128
+
+pub const SQLITE_OPEN_NOMUTEX: i32 = 32768
+
+pub const SQLITE_OPEN_FULLMUTEX: i32 = 65536
+
+pub const SQLITE_OPEN_EXRESCODE: i32 = 33554432
+
+pub const SQLITE_PREPARE_PERSISTENT: u32 = 1
+
+pub const SQLITE_UTF8: u8 = 1
+
+/// The `sqlite3_bind_text64` and `sqlite3_result_text64` destructor that tells SQLite the text
+/// outlives the statement or the call, so it is not copied.
+pub const SQLITE_STATIC: isize = 0
+
+/// The `sqlite3_bind_text64` and `sqlite3_result_text64` destructor that tells SQLite to copy the
+/// text before the call returns.
+pub const SQLITE_TRANSIENT: isize = -1
+
+/// A user function's `xFunc`, `xStep` or `xInverse`: the call context, the argument count and the
+/// argument values (`sqlite3_value **`).
+pub type FunctionCallback = ?extern "C" fn(?*mut u8, i32, ?*mut ?*mut u8) -> ()
+
+/// A user function's `xFinal` or `xValue`, given the call context.
+pub type FinalCallback = ?extern "C" fn(?*mut u8) -> ()
+
+/// A destructor SQLite calls with the pointer it was given, such as the user data of a function
+/// or a blob handed over with `sqlite3_bind_blob64`.
+pub type DestroyCallback = extern "C" fn(?*mut u8) -> ()
+
+/// The `sqlite3changeset_apply` table filter: the user data and the table name. Nonzero applies
+/// the table's changes.
+pub type ChangesetFilter = ?extern "C" fn(?*mut u8, ?[*]const u8) -> i32
+
+/// The `sqlite3changeset_apply` conflict handler: the user data, the conflict kind and the
+/// changeset iterator. It returns `SQLITE_CHANGESET_OMIT`, `REPLACE` or `ABORT`.
+pub type ChangesetConflict = extern "C" fn(?*mut u8, i32, ?*mut u8) -> i32
+
+/// The `sqlite3_set_authorizer` callback: the user data, the action code, two action arguments,
+/// the database name and the innermost trigger or view. It returns `SQLITE_OK`, `DENY` or
+/// `IGNORE`.
+pub type Authorizer =
+  ?extern "C" fn(?*mut u8, i32, ?[*]const u8, ?[*]const u8, ?[*]const u8, ?[*]const u8,) -> i32
+
+pub unsafe extern "C" fn silk_sqlite_open(
+  path: ?[*]const u8,
+  length: usize,
+  flags: i32,
+  out: *mut ?*mut u8,
+) -> i32
+
+pub unsafe extern "C" fn silk_sqlite_strlen(text: ?[*]const u8) -> usize
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn silk_sqlite_prepare(
+  db: ?*mut u8,
+  sql: ?[*]const u8,
+  length: usize,
+  flags: u32,
+  out: *mut ?*mut u8,
+  consumed: *mut usize,
+) -> i32
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn silk_sqlite_exec(db: ?*mut u8, sql: ?[*]const u8, length: usize) -> i32
+
+pub unsafe extern "C" fn silk_sqlite_bind_text(
+  statement: ?*mut u8,
+  index: i32,
+  text: ?[*]const u8,
+  length: usize,
+) -> i32
+
+pub unsafe extern "C" fn silk_sqlite_bind_blob(
+  statement: ?*mut u8,
+  index: i32,
+  bytes: ?[*]const u8,
+  length: usize,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_libversion() -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_libversion_number() -> i32
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_close_v2(db: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_errmsg(db: ?*mut u8) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_errstr(code: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_extended_errcode(db: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_busy_timeout(db: ?*mut u8, milliseconds: i32) -> i32
+
+pub unsafe extern "C" fn sqlite3_changes64(db: ?*mut u8) -> i64
+
+pub unsafe extern "C" fn sqlite3_total_changes64(db: ?*mut u8) -> i64
+
+pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: ?*mut u8) -> i64
+
+pub unsafe extern "C" fn sqlite3_get_autocommit(db: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_interrupt(db: ?*mut u8) -> ()
+
+pub unsafe extern "C" fn sqlite3_db_handle(statement: ?*mut u8) -> ?*mut u8
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_finalize(statement: ?*mut u8) -> i32
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_reset(statement: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_clear_bindings(statement: ?*mut u8) -> i32
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_step(statement: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_sql(statement: ?*mut u8) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_stmt_readonly(statement: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_parameter_count(statement: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_parameter_index(
+  statement: ?*mut u8,
+  name: ?[*]const u8,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_null(statement: ?*mut u8, index: i32) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_int64(statement: ?*mut u8, index: i32, value: i64) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_double(statement: ?*mut u8, index: i32, value: f64) -> i32
+
+pub unsafe extern "C" fn sqlite3_bind_zeroblob64(
+  statement: ?*mut u8,
+  index: i32,
+  length: u64,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_column_count(statement: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_column_name(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_type(statement: ?*mut u8, index: i32) -> i32
+
+pub unsafe extern "C" fn sqlite3_column_int64(statement: ?*mut u8, index: i32) -> i64
+
+pub unsafe extern "C" fn sqlite3_column_double(statement: ?*mut u8, index: i32) -> f64
+
+pub unsafe extern "C" fn sqlite3_column_text(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_blob(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_bytes(statement: ?*mut u8, index: i32) -> i32
+
+@foreign(noCapture: .("path", "out", "vfs"))
+pub unsafe extern "C" fn sqlite3_open_v2(
+  path: ?[*]const u8,
+  out: *mut ?*mut u8,
+  flags: i32,
+  vfs: ?[*]const u8,
+) -> i32
+
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_prepare_v2(
+  db: ?*mut u8,
+  sql: ?[*]const u8,
+  length: i32,
+  out: *mut ?*mut u8,
+  tail: ?*mut ?[*]const u8,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_free(pointer: ?*mut u8) -> ()
+
+pub unsafe extern "C" fn sqlite3_malloc64(length: u64) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_db_config(db: ?*mut u8, operation: i32, ...) -> i32
+
+pub unsafe extern "C" fn sqlite3_limit(db: ?*mut u8, category: i32, value: i32) -> i32
+
+@foreign(noCapture: .("name"))
+pub unsafe extern "C" fn sqlite3_db_filename(db: ?*mut u8, name: ?[*]const u8) -> ?[*]const u8
+
+// The text is allocated with `sqlite3_malloc`; free it with `sqlite3_free`.
+pub unsafe extern "C" fn sqlite3_expanded_sql(statement: ?*mut u8) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_bind_parameter_name(statement: ?*mut u8, index: i32) ->
+  ?[*]const u8
+
+// `destructor` is `SQLITE_STATIC` or `SQLITE_TRANSIENT`.
+pub unsafe extern "C" fn sqlite3_bind_text64(
+  statement: ?*mut u8,
+  index: i32,
+  text: ?[*]const u8,
+  length: u64,
+  destructor: isize,
+  encoding: u8,
+) -> i32
+
+// SQLite owns `data` from the call on and frees it with `destructor`, even when binding fails.
+@threadCallbacks("destructor")
+pub unsafe extern "C" fn sqlite3_bind_blob64(
+  statement: ?*mut u8,
+  index: i32,
+  data: ?*mut u8,
+  length: u64,
+  destructor: DestroyCallback,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_column_value(statement: ?*mut u8, index: i32) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_column_decltype(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_database_name(statement: ?*mut u8, index: i32) ->
+  ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_table_name(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_column_origin_name(statement: ?*mut u8, index: i32) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_value_type(value: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_value_int64(value: ?*mut u8) -> i64
+
+pub unsafe extern "C" fn sqlite3_value_double(value: ?*mut u8) -> f64
+
+pub unsafe extern "C" fn sqlite3_value_text(value: ?*mut u8) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_value_blob(value: ?*mut u8) -> ?[*]const u8
+
+pub unsafe extern "C" fn sqlite3_value_bytes(value: ?*mut u8) -> i32
+
+@deferredCallbacks("function", "step", "final")
+@threadCallbacks("destroy")
+pub unsafe extern "C" fn sqlite3_create_function_v2(
+  db: ?*mut u8,
+  name: ?[*]const u8,
+  arguments: i32,
+  flags: i32,
+  data: ?*mut u8,
+  function: FunctionCallback,
+  step: FunctionCallback,
+  final: FinalCallback,
+  destroy: DestroyCallback,
+) -> i32
+
+@deferredCallbacks("step", "final", "value", "inverse")
+@threadCallbacks("destroy")
+pub unsafe extern "C" fn sqlite3_create_window_function(
+  db: ?*mut u8,
+  name: ?[*]const u8,
+  arguments: i32,
+  flags: i32,
+  data: ?*mut u8,
+  step: FunctionCallback,
+  final: FinalCallback,
+  value: FinalCallback,
+  inverse: FunctionCallback,
+  destroy: DestroyCallback,
+) -> i32
+
+pub unsafe extern "C" fn sqlite3_user_data(context: ?*mut u8) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_aggregate_context(context: ?*mut u8, bytes: i32) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_result_null(context: ?*mut u8) -> ()
+
+pub unsafe extern "C" fn sqlite3_result_double(context: ?*mut u8, value: f64) -> ()
+
+pub unsafe extern "C" fn sqlite3_result_int64(context: ?*mut u8, value: i64) -> ()
+
+// `destructor` is `SQLITE_STATIC` or `SQLITE_TRANSIENT`.
+@foreign(noCapture: .("text"))
+pub unsafe extern "C" fn sqlite3_result_text64(
+  context: ?*mut u8,
+  text: ?[*]const u8,
+  length: u64,
+  destructor: isize,
+  encoding: u8,
+) -> ()
+
+// SQLite owns `data` from the call on and frees it with `destructor`.
+@threadCallbacks("destructor")
+pub unsafe extern "C" fn sqlite3_result_blob64(
+  context: ?*mut u8,
+  data: ?*mut u8,
+  length: u64,
+  destructor: DestroyCallback,
+) -> ()
+
+@foreign(noCapture: .("message"))
+pub unsafe extern "C" fn sqlite3_result_error(
+  context: ?*mut u8,
+  message: ?[*]const u8,
+  length: i32,
+) -> ()
+
+pub unsafe extern "C" fn sqlite3_result_error_nomem(context: ?*mut u8) -> ()
+
+@deferredCallbacks("callback")
+pub unsafe extern "C" fn sqlite3_set_authorizer(
+  db: ?*mut u8,
+  callback: Authorizer,
+  data: ?*mut u8,
+) -> i32
+
+// `error` receives a message allocated with `sqlite3_malloc`, or null; free it with `sqlite3_free`.
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3_load_extension(
+  db: ?*mut u8,
+  file: ?[*]const u8,
+  entry: ?[*]const u8,
+  error: *mut ?*mut u8,
+) -> i32
+
+@foreign(noCapture: .("name", "length"))
+pub unsafe extern "C" fn sqlite3_serialize(
+  db: ?*mut u8,
+  name: ?[*]const u8,
+  length: *mut i64,
+  flags: u32,
+) -> ?*mut u8
+
+// With `SQLITE_DESERIALIZE_FREEONCLOSE` SQLite owns `data`, which must come from
+// `sqlite3_malloc64`, even when the call fails.
+@foreign(noCapture: .("name"))
+pub unsafe extern "C" fn sqlite3_deserialize(
+  db: ?*mut u8,
+  name: ?[*]const u8,
+  data: ?*mut u8,
+  length: i64,
+  capacity: i64,
+  flags: u32,
+) -> i32
+
+@foreign(noCapture: .("destination", "source"))
+pub unsafe extern "C" fn sqlite3_backup_init(
+  destination: ?*mut u8,
+  destinationName: ?[*]const u8,
+  source: ?*mut u8,
+  sourceName: ?[*]const u8,
+) -> ?*mut u8
+
+pub unsafe extern "C" fn sqlite3_backup_step(backup: ?*mut u8, pages: i32) -> i32
+
+pub unsafe extern "C" fn sqlite3_backup_remaining(backup: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_backup_pagecount(backup: ?*mut u8) -> i32
+
+pub unsafe extern "C" fn sqlite3_backup_finish(backup: ?*mut u8) -> i32
+
+@foreign(noCapture: .("name", "out"))
+pub unsafe extern "C" fn sqlite3session_create(
+  db: ?*mut u8,
+  name: ?[*]const u8,
+  out: *mut ?*mut u8,
+) -> i32
+
+// A null `table` attaches every table.
+@foreign(noCapture: .("table"))
+pub unsafe extern "C" fn sqlite3session_attach(session: ?*mut u8, table: ?[*]const u8) -> i32
+
+pub unsafe extern "C" fn sqlite3session_delete(session: ?*mut u8) -> ()
+
+// The changeset is allocated with `sqlite3_malloc`; free it with `sqlite3_free`.
+@foreign(noCapture: .("length", "out"))
+pub unsafe extern "C" fn sqlite3session_changeset(
+  session: ?*mut u8,
+  length: *mut i32,
+  out: *mut ?*mut u8,
+) -> i32
+
+// The patchset is allocated with `sqlite3_malloc`; free it with `sqlite3_free`.
+@foreign(noCapture: .("length", "out"))
+pub unsafe extern "C" fn sqlite3session_patchset(
+  session: ?*mut u8,
+  length: *mut i32,
+  out: *mut ?*mut u8,
+) -> i32
+
+// `filter` and `conflict` run during the call only.
+@callbacks("filter", "conflict")
+@invokesDeferredCallbacks
+pub unsafe extern "C" fn sqlite3changeset_apply(
+  db: ?*mut u8,
+  length: i32,
+  changeset: ?*mut u8,
+  filter: ChangesetFilter,
+  conflict: ChangesetConflict,
+  data: ?*mut u8,
+) -> i32

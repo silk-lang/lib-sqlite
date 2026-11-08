@@ -1,0 +1,852 @@
+//! SQLite databases: open a file or an in-memory database, run SQL, and read rows.
+//!
+//! A [`Connection`] owns one database handle. [`Connection.prepare`] compiles one SQL statement
+//! into a [`Statement`], which binds parameters, steps through result rows and can be reset and
+//! reused, so a hot query is compiled once. [`Connection.execute`] runs a script of statements
+//! that return no rows. [`Connection.begin`] starts a [`Transaction`] that rolls back when it is
+//! dropped without [`Transaction.commit`].
+//!
+//! Every failure is a [`SqliteError`] carrying SQLite's extended result code and message.
+//! SQLite is compiled into the program from the pinned amalgamation, so no system library is
+//! needed. Native macOS and Linux targets only.
+import silk.collections.bytes { Bytes }
+import silk.collections.slice { Slice }
+import silk.core.option { Option }
+import silk.core.ownership { Copy, Drop }
+import silk.core.result { Result }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.num.i32
+import silk.num.i64
+import silk.num.usize
+import silk.io.writer { Writer, WriterError }
+import silk.text.format { Debug, Display, Format, Formatter }
+import silk.text.string { InvalidUtf8, String }
+import sys
+
+/// A failed SQLite call.
+///
+/// `code` is SQLite's extended result code, such as `2067` (`SQLITE_CONSTRAINT_UNIQUE`); its low
+/// byte is the primary code, such as `19` (`SQLITE_CONSTRAINT`), which [`SqliteError.primary`]
+/// returns. `message` is SQLite's English description of the failure, copied when it happened.
+pub struct SqliteError {
+  /// The extended result code.
+  pub code: i32,
+  /// SQLite's description of the failure.
+  pub message: String,
+}
+
+impl Debug for SqliteError {
+  /// Writes the code and message, as `SqliteError { code: 1, message: "no such table: t" }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    let mut record = run Format.debugRecord("SqliteError", &mut formatter)
+    run Format.debugField(&mut record, "code", &self.code, &mut formatter)
+    let message = self.message.view()
+    run Format.debugField(&mut record, "message", &message, &mut formatter)
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+
+impl Display for SqliteError {
+  /// Writes the message and the code, as `no such table: t (code 1)`.
+  effect fn display(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer {
+    run Format.write(&mut formatter, String.utf8Bytes(self.message.view()))
+    run Format.write(&mut formatter, b" (code ")
+    run Display.display(&self.code, &mut formatter)
+    return run Format.write(&mut formatter, b")")
+  }
+}
+
+impl SqliteError {
+  /// The primary result code: the low byte of `code`, such as `5` for `SQLITE_BUSY`.
+  pub fn primary(self: &Self) -> i32 {
+    return self.code & 255
+  }
+
+  /// Whether another connection holds a lock this one needs (`SQLITE_BUSY` or `SQLITE_LOCKED`).
+  /// Retrying later, or setting [`Connection.busyTimeout`], can succeed.
+  pub fn isBusy(self: &Self) -> bool {
+    let primary = self.primary()
+    return primary == BUSY || primary == LOCKED
+  }
+
+  /// Whether a `UNIQUE`, `NOT NULL`, `CHECK`, `FOREIGN KEY` or primary key constraint refused the
+  /// change (`SQLITE_CONSTRAINT`).
+  pub fn isConstraint(self: &Self) -> bool {
+    return self.primary() == CONSTRAINT
+  }
+}
+
+/// `SQLITE_ERROR`: a generic failure, such as an SQL syntax error.
+pub const ERROR: i32 = 1
+
+/// `SQLITE_BUSY`: the database file is locked by another connection.
+pub const BUSY: i32 = 5
+
+/// `SQLITE_LOCKED`: a table is locked by this connection.
+pub const LOCKED: i32 = 6
+
+/// `SQLITE_NOMEM`: SQLite could not allocate memory.
+pub const NOMEM: i32 = 7
+
+/// `SQLITE_READONLY`: a write to a read-only database.
+pub const READONLY: i32 = 8
+
+/// `SQLITE_CANTOPEN`: the database file could not be opened.
+pub const CANTOPEN: i32 = 14
+
+/// `SQLITE_CONSTRAINT`: a constraint refused the change.
+pub const CONSTRAINT: i32 = 19
+
+/// `SQLITE_MISMATCH`: a value of the wrong type, such as a text column that is not UTF-8.
+pub const MISMATCH: i32 = 20
+
+/// `SQLITE_MISUSE`: the API was used out of order, such as binding to a running statement.
+pub const MISUSE: i32 = 21
+
+/// `SQLITE_RANGE`: a parameter index outside the statement's parameters.
+pub const RANGE: i32 = 25
+
+/// How [`Connection.openWith`] opens the database file.
+pub union OpenMode {
+  /// Reading only. The file must exist.
+  ReadOnly,
+  /// Reading and writing. The file must exist.
+  ReadWrite,
+  /// Reading and writing, creating the file when it does not exist.
+  ReadWriteCreate,
+}
+
+impl Copy for OpenMode {}
+
+/// The SQLite storage class of a value.
+pub union ValueType {
+  /// A signed 64-bit integer.
+  Integer,
+  /// A 64-bit IEEE floating point number.
+  Real,
+  /// Text, stored as UTF-8.
+  Text,
+  /// Bytes, stored as given.
+  Blob,
+  /// SQL `NULL`.
+  Null,
+}
+
+impl Copy for ValueType {}
+
+impl ValueType {
+  /// Whether both are the same storage class.
+  pub fn same(self: &Self, other: ValueType) -> bool {
+    return self.index() == other.index()
+  }
+
+  fn index(self: &Self) -> i32 {
+    return match &self.* {
+      ValueType.Integer => 1
+      ValueType.Real => 2
+      ValueType.Text => 3
+      ValueType.Blob => 4
+      ValueType.Null => 5
+    }
+  }
+
+  fn fromCode(code: i32) -> ValueType {
+    if code == sys.SQLITE_INTEGER {
+      return ValueType.Integer
+    }
+    if code == sys.SQLITE_FLOAT {
+      return ValueType.Real
+    }
+    if code == sys.SQLITE_TEXT {
+      return ValueType.Text
+    }
+    if code == sys.SQLITE_BLOB {
+      return ValueType.Blob
+    }
+    return ValueType.Null
+  }
+}
+
+/// One owned SQLite value, for code that handles columns of any type, such as a generic row
+/// dump. [`Statement.columnValue`] reads one and [`Statement.bindValue`] binds one.
+pub union Value {
+  /// SQL `NULL`.
+  Null,
+  /// A signed 64-bit integer.
+  Integer {
+    /// The integer.
+    pub value: i64
+  },
+  /// A 64-bit floating point number.
+  Real {
+    /// The number.
+    pub value: f64
+  },
+  /// UTF-8 text.
+  Text {
+    /// The text.
+    pub value: String
+  },
+  /// Bytes.
+  Blob {
+    /// The bytes.
+    pub value: Bytes
+  },
+}
+
+/// How [`Connection.begin`] starts a transaction.
+pub union TransactionKind {
+  /// `BEGIN DEFERRED`: takes locks when the transaction first reads or writes.
+  Deferred,
+  /// `BEGIN IMMEDIATE`: takes the write lock at once, so a later write never fails as busy.
+  Immediate,
+  /// `BEGIN EXCLUSIVE`: like `Immediate`; in rollback-journal mode it also keeps out readers.
+  Exclusive,
+}
+
+impl Copy for TransactionKind {}
+
+/// The SQLite library version, such as `"3.54.1"`.
+///
+/// # Errors
+/// - `OutOfMemoryError` when the copy cannot be allocated.
+pub effect fn version() -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let anchor = 0
+  let bytes = unsafe borrowedText<i32>(&anchor, unsafe sys.sqlite3_libversion())
+  return run String.copy(unsafe String.fromUtf8Unchecked(bytes))
+}
+
+/// The SQLite library version as a number, such as `3054001` for 3.54.1.
+pub fn versionNumber() -> i32 {
+  return unsafe sys.sqlite3_libversion_number()
+}
+
+// The bytes of a NUL-terminated C string that stays valid while `anchor` is borrowed.
+unsafe fn borrowedText<'a, A>(anchor: &'a A, text: ?[*]const u8) -> &'a [u8] {
+  return match Pointer.nonNullMany<u8>(text) {
+    Option<[*]const u8>.Some { value } => unsafe Pointer.borrowMany<'a, A, u8>(
+      anchor,
+      value,
+      unsafe sys.silk_sqlite_strlen(text),
+    )
+    Option<[*]const u8>.None => b""
+  }
+}
+
+// The error SQLite reports for `code` on the database `db`, or for `code` alone when `db` is null.
+effect fn failure(db: ?*mut u8, code: i32) -> SqliteError
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = if Pointer.isNull<u8>(db) {
+    unsafe sys.sqlite3_errstr(code)
+  } else {
+    unsafe sys.sqlite3_errmsg(db)
+  }
+  let anchor = 0
+  let bytes = unsafe borrowedText<i32>(&anchor, text)
+  let message = match run String.copyUtf8(bytes) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error: _invalid } => String.make()
+  }
+  return SqliteError { code: code, message: move message }
+}
+
+// An error this library reports itself, with SQLite's result code `code`.
+effect fn refusal(code: i32, message: string) -> SqliteError
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return SqliteError { code: code, message: run String.copy(message) }
+}
+
+/// An open SQLite database.
+///
+/// Dropping the connection closes it. A [`Statement`] prepared on it stays valid after that: the
+/// database is closed once its last statement is dropped too.
+///
+/// SQLite is built thread-safe, but a connection is meant for one thread at a time; open one
+/// connection per thread, and use WAL mode (`PRAGMA journal_mode = WAL`) so readers do not block
+/// the writer.
+pub struct Connection {
+  handle: ?*mut u8,
+}
+
+impl Drop for Connection {
+  fn drop(self: &mut Connection) -> () {
+    let handle = Intrinsic.replace(self.handle, Pointer.null<u8>())
+    if !Pointer.isNull<u8>(handle) {
+      let _ignored = unsafe sys.sqlite3_close_v2(handle)
+    }
+  }
+}
+
+impl Connection {
+  /// Opens the database file at `path` for reading and writing, creating it when it does not
+  /// exist.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `CANTOPEN` when the file cannot be opened or created.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn open(path: string) -> Connection
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Connection.openWith(path, OpenMode.ReadWriteCreate)
+  }
+
+  /// Opens a new, empty database that lives in memory and disappears when the connection closes.
+  ///
+  /// # Errors
+  /// - `SqliteError` when SQLite cannot allocate the database.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn openMemory() -> Connection
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    return run Connection.openWith(":memory:", OpenMode.ReadWriteCreate)
+  }
+
+  /// Opens the database file at `path` as `mode` says. The path `":memory:"` opens a private
+  /// in-memory database, and an empty path a private temporary file.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `CANTOPEN` when the file cannot be opened, or does not exist and `mode`
+  ///   does not create it.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn openWith(path: string, mode: OpenMode) -> Connection
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let flags = match mode {
+      OpenMode.ReadOnly => sys.SQLITE_OPEN_READONLY
+      OpenMode.ReadWrite => sys.SQLITE_OPEN_READWRITE
+      OpenMode.ReadWriteCreate => sys.SQLITE_OPEN_READWRITE | sys.SQLITE_OPEN_CREATE
+    }
+    let bytes = String.utf8Bytes(path)
+    let mut handle = Pointer.null<u8>()
+    let code = unsafe sys.silk_sqlite_open(
+      Pointer.fromSlice<u8>(bytes),
+      bytes.length,
+      flags,
+      Pointer.fromMutRef<?*mut u8>(&mut handle),
+    )
+
+    // SQLite returns a handle even when opening fails, so the connection closes it either way.
+    let connection = Connection { handle: handle }
+    if code != sys.SQLITE_OK {
+      fail run failure(handle, code)
+    }
+    return move connection
+  }
+
+  /// Runs every statement of `sql` in order, such as a schema or a migration, and discards any
+  /// rows they return. Use [`Connection.prepare`] for statements with parameters or results.
+  ///
+  /// # Errors
+  /// - `SqliteError` from the first statement that fails; the statements before it stay applied
+  ///   unless they ran inside a transaction.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn execute(self: &Self, sql: string) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(sql)
+    let code = unsafe sys.silk_sqlite_exec(self.handle, Pointer.fromSlice<u8>(bytes), bytes.length)
+    if code != sys.SQLITE_OK {
+      fail run failure(self.handle, code)
+    }
+  }
+
+  /// Compiles the single SQL statement `sql` into a [`Statement`].
+  ///
+  /// The statement is prepared for reuse (`SQLITE_PREPARE_PERSISTENT`): keep it and call
+  /// [`Statement.reset`] between runs instead of preparing the same SQL again.
+  ///
+  /// # Errors
+  /// - `SqliteError` when `sql` does not compile, names a missing table or column, is empty, or
+  ///   holds more than one statement (`MISUSE`).
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn prepare(self: &Self, sql: string) -> Statement
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(sql)
+    let mut handle = Pointer.null<u8>()
+    let mut consumed = usize.ZERO
+    let code = unsafe sys.silk_sqlite_prepare(
+      self.handle,
+      Pointer.fromSlice<u8>(bytes),
+      bytes.length,
+      sys.SQLITE_PREPARE_PERSISTENT,
+      Pointer.fromMutRef<?*mut u8>(&mut handle),
+      Pointer.fromMutRef<usize>(&mut consumed),
+    )
+    let statement = Statement { handle: handle }
+    if code != sys.SQLITE_OK {
+      fail run failure(self.handle, code)
+    }
+    if Pointer.isNull<u8>(handle) {
+      fail run refusal(MISUSE, "the SQL holds no statement")
+    }
+    if !onlySpace(Slice.view<u8>(bytes, consumed, bytes.length - consumed)) {
+      fail run refusal(
+        MISUSE,
+        "the SQL holds more than one statement; use Connection.execute for scripts",
+      )
+    }
+    return move statement
+  }
+
+  /// Starts a transaction of the given kind. It rolls back when the returned [`Transaction`] is
+  /// dropped, unless [`Transaction.commit`] ran first.
+  ///
+  /// # Errors
+  /// - `SqliteError` when a transaction is already open (`ERROR`), or when `Immediate` or
+  ///   `Exclusive` cannot take the write lock (`BUSY`).
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn begin<'c>(self: &'c Self, kind: TransactionKind) -> Transaction<'c>
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let sql = match kind {
+      TransactionKind.Deferred => "BEGIN DEFERRED"
+      TransactionKind.Immediate => "BEGIN IMMEDIATE"
+      TransactionKind.Exclusive => "BEGIN EXCLUSIVE"
+    }
+    run self.execute(sql)
+    return Transaction<'c> { connection: self, open: true }
+  }
+
+  /// Makes a call that finds a table locked wait up to `milliseconds` for the lock, retrying,
+  /// before it fails with `BUSY`. `0` turns waiting off, which is the default.
+  pub fn busyTimeout(self: &Self, milliseconds: i32) -> () {
+    let _ignored = unsafe sys.sqlite3_busy_timeout(self.handle, milliseconds)
+  }
+
+  /// The rows the most recent `INSERT`, `UPDATE` or `DELETE` changed, not counting triggers.
+  pub fn changes(self: &Self) -> i64 {
+    return unsafe sys.sqlite3_changes64(self.handle)
+  }
+
+  /// The rows all `INSERT`, `UPDATE` and `DELETE` statements changed since the connection opened.
+  pub fn totalChanges(self: &Self) -> i64 {
+    return unsafe sys.sqlite3_total_changes64(self.handle)
+  }
+
+  /// The rowid of the most recent successful `INSERT` into a rowid table, or `0` when there was
+  /// none.
+  pub fn lastInsertRowId(self: &Self) -> i64 {
+    return unsafe sys.sqlite3_last_insert_rowid(self.handle)
+  }
+
+  /// Whether no transaction is open, so each statement commits on its own.
+  pub fn isAutocommit(self: &Self) -> bool {
+    return unsafe sys.sqlite3_get_autocommit(self.handle) != 0
+  }
+}
+
+fn onlySpace(bytes: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte != 32 && byte != 9 && byte != 10 && byte != 13 && byte != 12 && byte != 59 {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// An open transaction on a [`Connection`], from [`Connection.begin`].
+///
+/// Dropping it without [`Transaction.commit`] rolls the transaction back, so an early `return`
+/// or a failure inside the transaction leaves the database unchanged. The connection stays usable
+/// for queries while the transaction is open.
+pub struct Transaction<'c> {
+  connection: &'c Connection,
+  open: bool,
+}
+
+impl<'c> Drop for Transaction<'c> {
+  fn drop(self: &mut Transaction<'c>) -> () {
+    if self.open {
+      self.open = false
+      let handle = self.connection.handle
+      let sql = b"ROLLBACK"
+      let _ignored = unsafe sys.silk_sqlite_exec(handle, Pointer.fromSlice<u8>(sql), sql.length)
+    }
+  }
+}
+
+impl<'c> Transaction<'c> {
+  /// The connection the transaction runs on.
+  pub fn on(self: &Self) -> &'c Connection {
+    return self.connection
+  }
+
+  /// Commits the transaction. After a failed commit the transaction is still open, and dropping
+  /// it rolls back.
+  ///
+  /// # Errors
+  /// - `SqliteError` when the commit fails, such as `BUSY` while readers hold the database in
+  ///   rollback-journal mode, or a deferred foreign key violation (`CONSTRAINT`).
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn commit(self: &mut Self) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.connection.execute("COMMIT")
+    self.open = false
+  }
+
+  /// Rolls the transaction back now instead of when it is dropped.
+  ///
+  /// # Errors
+  /// - `SqliteError` when SQLite cannot roll back.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn rollback(self: &mut Self) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.open = false
+    run self.connection.execute("ROLLBACK")
+  }
+}
+
+/// One compiled SQL statement, from [`Connection.prepare`].
+///
+/// Bind parameters with the `bind` functions, then call [`Statement.step`] until it returns
+/// `false`, reading the columns of each row in between. [`Statement.reset`] rewinds the statement
+/// so it runs again with new bindings. Parameters are numbered from 1, as in SQL (`?1`, or the
+/// order of `?` and named parameters), and columns from 0.
+///
+/// A text or blob read from a row borrows the statement, so it stays valid until the next
+/// `step`, `reset` or drop. Dropping the statement finalizes it.
+pub struct Statement {
+  handle: ?*mut u8,
+}
+
+impl Drop for Statement {
+  fn drop(self: &mut Statement) -> () {
+    let handle = Intrinsic.replace(self.handle, Pointer.null<u8>())
+    if !Pointer.isNull<u8>(handle) {
+      let _ignored = unsafe sys.sqlite3_finalize(handle)
+    }
+  }
+}
+
+impl Statement {
+  /// The SQL the statement was prepared from.
+  pub fn sql(self: &Self) -> string {
+    let bytes = unsafe borrowedText<Statement>(self, unsafe sys.sqlite3_sql(self.handle))
+    return unsafe String.fromUtf8Unchecked(bytes)
+  }
+
+  /// Whether the statement leaves the database unchanged, such as a `SELECT`.
+  pub fn isReadOnly(self: &Self) -> bool {
+    return unsafe sys.sqlite3_stmt_readonly(self.handle) != 0
+  }
+
+  /// The number of parameters; the largest parameter index.
+  pub fn parameterCount(self: &Self) -> usize {
+    return i32.toUsize(unsafe sys.sqlite3_bind_parameter_count(self.handle))
+  }
+
+  /// The index of the named parameter `name`, written with its prefix as in the SQL, such as
+  /// `":id"`, or none when the statement has no such parameter.
+  pub effect fn parameterIndex(self: &Self, name: string) -> Option<usize>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut terminated = run Bytes.makeWithCapacity(String.byteLength(name) + usize.ONE)
+    run terminated.append(String.utf8Bytes(name))
+    run terminated.append(b"\0")
+    let index = unsafe sys.sqlite3_bind_parameter_index(
+      self.handle,
+      Pointer.fromSlice<u8>(terminated.asSlice()),
+    )
+    if index == 0 {
+      return Option<usize>.None
+    }
+    return Option<usize>.some(i32.toUsize(index))
+  }
+
+  /// Binds SQL `NULL` to parameter `index`.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, or `MISUSE` while the statement
+  ///   is running (after `step` returned `true`, before `reset`).
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindNull(self: &mut Self, index: usize) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.check(unsafe sys.sqlite3_bind_null(self.handle, parameter(index)))
+  }
+
+  /// Binds the integer `value` to parameter `index`.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, or `MISUSE` while the statement
+  ///   is running.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindInt(self: &mut Self, index: usize, value: i64) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.check(unsafe sys.sqlite3_bind_int64(self.handle, parameter(index), value))
+  }
+
+  /// Binds the floating point `value` to parameter `index`.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, or `MISUSE` while the statement
+  ///   is running.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindFloat(self: &mut Self, index: usize, value: f64) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.check(unsafe sys.sqlite3_bind_double(self.handle, parameter(index), value))
+  }
+
+  /// Binds a copy of the text `value` to parameter `index`. Empty text binds `''`, not `NULL`.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, `MISUSE` while the statement
+  ///   is running, or `NOMEM` when SQLite cannot copy the text.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindText(self: &mut Self, index: usize, value: string) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let bytes = String.utf8Bytes(value)
+    run self.check(
+      unsafe sys.silk_sqlite_bind_text(
+        self.handle,
+        parameter(index),
+        Pointer.fromSlice<u8>(bytes),
+        bytes.length,
+      ),
+    )
+  }
+
+  /// Binds a copy of the bytes `value` to parameter `index`. Empty bytes bind an empty blob, not
+  /// `NULL`.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, `MISUSE` while the statement
+  ///   is running, or `NOMEM` when SQLite cannot copy the bytes.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindBlob(self: &mut Self, index: usize, value: &[u8]) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.check(
+      unsafe sys.silk_sqlite_bind_blob(
+        self.handle,
+        parameter(index),
+        Pointer.fromSlice<u8>(value),
+        value.length,
+      ),
+    )
+  }
+
+  /// Binds a blob of `length` zero bytes to parameter `index`, without building it in memory.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `RANGE` when `index` is not a parameter, `MISUSE` while the statement
+  ///   is running, or `TOOBIG` (18) past SQLite's blob size limit.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn bindZeroBlob(self: &mut Self, index: usize, length: u64) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    run self.check(unsafe sys.sqlite3_bind_zeroblob64(self.handle, parameter(index), length))
+  }
+
+  /// Binds `value` to parameter `index` with the matching `bind` function.
+  ///
+  /// # Errors
+  /// - As the `bind` function for `value`'s type.
+  pub effect fn bindValue(self: &mut Self, index: usize, value: &Value) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    match &value.* {
+      Value.Null => run self.bindNull(index)
+      Value.Integer { value: number } => run self.bindInt(index, number)
+      Value.Real { value: number } => run self.bindFloat(index, number)
+      Value.Text { value: text } => run self.bindText(index, text.view())
+      Value.Blob { value: bytes } => run self.bindBlob(index, bytes.asSlice())
+    }
+  }
+
+  /// Sets every parameter back to `NULL`. [`Statement.reset`] keeps bindings, so call this when
+  /// a reused statement should not see the previous run's values.
+  pub fn clearBindings(self: &mut Self) -> () {
+    let _ignored = unsafe sys.sqlite3_clear_bindings(self.handle)
+  }
+
+  /// Runs the statement to its next result row. Returns `true` when a row is ready to read with
+  /// the `column` functions, and `false` when the statement has finished.
+  ///
+  /// Stepping again after `false` starts the statement over.
+  ///
+  /// # Errors
+  /// - `SqliteError` when the statement fails, such as `CONSTRAINT` for a duplicate key or `BUSY`
+  ///   when the database is locked. The statement is reset, so it can run again.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn step(self: &mut Self) -> bool
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    let code = unsafe sys.sqlite3_step(self.handle)
+    if code == sys.SQLITE_ROW {
+      return true
+    }
+    if code == sys.SQLITE_DONE {
+      return false
+    }
+    let error = run failure(unsafe sys.sqlite3_db_handle(self.handle), code)
+    let _ignored = unsafe sys.sqlite3_reset(self.handle)
+    fail move error
+  }
+
+  /// Runs a statement that returns no rows, such as an `INSERT`, from the start to its end and
+  /// resets it, so it is ready to bind and run again. Returns the rows it changed. Any result rows
+  /// are discarded.
+  ///
+  /// # Errors
+  /// - `SqliteError` when the statement fails, such as `CONSTRAINT` for a duplicate key.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn execute(self: &mut Self) -> i64
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    self.reset()
+    while run self.step() {}
+    self.reset()
+    return unsafe sys.sqlite3_changes64(unsafe sys.sqlite3_db_handle(self.handle))
+  }
+
+  /// Rewinds the statement so the next [`Statement.step`] runs it from the start. Bindings are
+  /// kept; [`Statement.clearBindings`] clears them. Resetting also releases the locks a
+  /// finished or abandoned query holds, so reset a reused query when done reading.
+  pub fn reset(self: &mut Self) -> () {
+    let _ignored = unsafe sys.sqlite3_reset(self.handle)
+  }
+
+  /// The number of columns in each result row; `0` for a statement that returns no rows.
+  pub fn columnCount(self: &Self) -> usize {
+    return i32.toUsize(unsafe sys.sqlite3_column_count(self.handle))
+  }
+
+  /// The name of result column `index`: its `AS` alias, or else a name SQLite chooses.
+  pub fn columnName(self: &Self, index: usize) -> string {
+    let bytes = unsafe borrowedText<Statement>(
+      self,
+      unsafe sys.sqlite3_column_name(self.handle, column(index)),
+    )
+    return unsafe String.fromUtf8Unchecked(bytes)
+  }
+
+  /// The storage class of column `index` in the current row.
+  pub fn columnType(self: &Self, index: usize) -> ValueType {
+    return ValueType.fromCode(unsafe sys.sqlite3_column_type(self.handle, column(index)))
+  }
+
+  /// Whether column `index` of the current row is `NULL`.
+  pub fn columnIsNull(self: &Self, index: usize) -> bool {
+    return unsafe sys.sqlite3_column_type(self.handle, column(index)) == sys.SQLITE_NULL
+  }
+
+  /// Column `index` of the current row as an integer. `NULL` reads as `0`, a real number is
+  /// truncated, and text is parsed as SQLite's `CAST(x AS INTEGER)` would.
+  pub fn columnInt(self: &Self, index: usize) -> i64 {
+    return unsafe sys.sqlite3_column_int64(self.handle, column(index))
+  }
+
+  /// Column `index` of the current row as a floating point number. `NULL` reads as `0.0`.
+  pub fn columnFloat(self: &Self, index: usize) -> f64 {
+    return unsafe sys.sqlite3_column_double(self.handle, column(index))
+  }
+
+  /// Column `index` of the current row as bytes. `NULL` reads as empty bytes, and a number as
+  /// its text. The bytes stay valid until the next `step`, `reset` or drop of the statement.
+  pub fn columnBlob(self: &Self, index: usize) -> &[u8] {
+    let pointer = unsafe sys.sqlite3_column_blob(self.handle, column(index))
+    let length = i32.toUsize(unsafe sys.sqlite3_column_bytes(self.handle, column(index)))
+    return match Pointer.nonNullMany<u8>(pointer) {
+      Option<[*]const u8>.Some { value } => unsafe Pointer.borrowMany<Statement, u8>(
+        self,
+        value,
+        length,
+      )
+      Option<[*]const u8>.None => b""
+    }
+  }
+
+  /// Column `index` of the current row as UTF-8 bytes, without checking that they are valid
+  /// UTF-8. `NULL` reads as empty bytes, and a number as its text. The bytes stay valid until the
+  /// next `step`, `reset` or drop of the statement.
+  pub fn columnTextBytes(self: &Self, index: usize) -> &[u8] {
+    let pointer = unsafe sys.sqlite3_column_text(self.handle, column(index))
+    let length = i32.toUsize(unsafe sys.sqlite3_column_bytes(self.handle, column(index)))
+    return match Pointer.nonNullMany<u8>(pointer) {
+      Option<[*]const u8>.Some { value } => unsafe Pointer.borrowMany<Statement, u8>(
+        self,
+        value,
+        length,
+      )
+      Option<[*]const u8>.None => b""
+    }
+  }
+
+  /// Column `index` of the current row as text. `NULL` reads as `""`, and a number as its text.
+  /// The text stays valid until the next `step`, `reset` or drop of the statement.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `MISMATCH` when the stored bytes are not valid UTF-8, as a blob can be.
+  /// - `OutOfMemoryError` when the error message cannot be copied.
+  pub effect fn columnText(self: &Self, index: usize) -> string
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    return match String.fromUtf8(self.columnTextBytes(index)) {
+      Result<string, InvalidUtf8>.Success { value } => value
+      Result<string, InvalidUtf8>.Failure { error: _invalid } => {
+        fail run refusal(MISMATCH, "the column is not valid UTF-8")
+      }
+    }
+  }
+
+  /// A copy of column `index` of the current row, keeping its storage class.
+  ///
+  /// # Errors
+  /// - `SqliteError` with `MISMATCH` when a text value is not valid UTF-8.
+  /// - `OutOfMemoryError` when the copy cannot be allocated.
+  pub effect fn columnValue(self: &Self, index: usize) -> Value
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    return match self.columnType(index) {
+      ValueType.Integer => Value.Integer { value: self.columnInt(index) }
+      ValueType.Real => Value.Real { value: self.columnFloat(index) }
+      ValueType.Text => Value.Text { value: run String.copy(run self.columnText(index)) }
+      ValueType.Blob => Value.Blob { value: run Bytes.copy(self.columnBlob(index)) }
+      ValueType.Null => Value.Null
+    }
+  }
+
+  effect fn check(self: &Self, code: i32) -> ()
+    ! SqliteError | OutOfMemoryError
+    ? &mut Allocator {
+    if code != sys.SQLITE_OK {
+      fail run failure(unsafe sys.sqlite3_db_handle(self.handle), code)
+    }
+  }
+}
+
+// A parameter index as SQLite's C type. An index past `i32` can never name a parameter, so it
+// maps to 0, which SQLite refuses with `SQLITE_RANGE`.
+fn parameter(index: usize) -> i32 {
+  return match usize.checkedToI32(index) {
+    Option<i32>.Some { value } => value
+    Option<i32>.None => 0
+  }
+}
+
+// A column index as SQLite's C type. SQLite reads a column it does not have as `NULL`.
+fn column(index: usize) -> i32 {
+  return match usize.checkedToI32(index) {
+    Option<i32>.Some { value } => value
+    Option<i32>.None => -1
+  }
+}

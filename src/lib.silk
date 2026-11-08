@@ -1,0 +1,3 @@
+//! Compile all SQLite exports when checking the package.
+import sys
+import sqlite

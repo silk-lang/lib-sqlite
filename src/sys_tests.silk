@@ -1,0 +1,198 @@
+//! Tests of the raw `sys` bindings for what the safe API does not wrap: column metadata, the
+//! session extension, serialization, backups and extension loading. They check that the package
+//! builds SQLite with those features.
+import silk.mem.allocator { OutOfMemoryError }
+import silk.mem.pointer { Pointer }
+import silk.core.option { Option }
+import silk.num.i32
+import silk.num.usize
+import silk.text.string { String }
+import silk.testing.testing { AssertionError, Testing }
+import sys
+
+type Failures = AssertionError<'static> | OutOfMemoryError
+
+fn text(value: &[u8]) -> ?[*]const u8 {
+  return Pointer.fromSlice<u8>(value)
+}
+
+fn none() -> ?[*]const u8 {
+  return unsafe Pointer.bytes<u8>(Pointer.null<u8>())
+}
+
+// The NUL-terminated C string `value` equals `expected`.
+fn same(value: ?[*]const u8, expected: &[u8]) -> bool {
+  return match Pointer.nonNullMany<u8>(value) {
+    Option<[*]const u8>.Some { value: start } => {
+      let anchor = 0
+      let length = unsafe sys.silk_sqlite_strlen(value)
+      let bytes = unsafe Pointer.borrowMany<i32, u8>(&anchor, start, length)
+      String.utf8Bytes(unsafe String.fromUtf8Unchecked(bytes)) == expected
+    }
+    Option<[*]const u8>.None => false
+  }
+}
+
+fn open() -> ?*mut u8 {
+  let mut db = Pointer.null<u8>()
+  let code = unsafe sys.sqlite3_open_v2(
+    text(b":memory:\0"),
+    Pointer.fromMutRef<?*mut u8>(&mut db),
+    sys.SQLITE_OPEN_READWRITE | sys.SQLITE_OPEN_CREATE,
+    none(),
+  )
+  if code != sys.SQLITE_OK {
+    let _closed = unsafe sys.sqlite3_close_v2(db)
+    return Pointer.null<u8>()
+  }
+  return db
+}
+
+fn execute(db: ?*mut u8, sql: &[u8]) -> i32 {
+  return unsafe sys.silk_sqlite_exec(db, Pointer.fromSlice<u8>(sql), sql.length)
+}
+
+effect fn columnMetadata() -> ()
+  ! Failures {
+  let db = open()
+  run Testing.expect(!Pointer.isNull<u8>(db), "an in-memory database opens")
+  run Testing.expect(
+    execute(db, b"CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)") == sys.SQLITE_OK,
+    "the table is created",
+  )
+  let sql = b"SELECT name AS label, 1 FROM t"
+  let mut statement = Pointer.null<u8>()
+  let code = unsafe sys.sqlite3_prepare_v2(
+    db,
+    Pointer.fromSlice<u8>(sql),
+    usize.toI32(sql.length),
+    Pointer.fromMutRef<?*mut u8>(&mut statement),
+    Pointer.null<?[*]const u8>(),
+  )
+  run Testing.expect(code == sys.SQLITE_OK, "the query compiles")
+  run Testing.expect(same(unsafe sys.sqlite3_column_origin_name(statement, 0), b"name"), "origin")
+  run Testing.expect(same(unsafe sys.sqlite3_column_table_name(statement, 0), b"t"), "table")
+  run Testing.expect(
+    same(unsafe sys.sqlite3_column_database_name(statement, 0), b"main"),
+    "database",
+  )
+  run Testing.expect(
+    same(unsafe sys.sqlite3_column_decltype(statement, 0), b"TEXT"),
+    "declared type",
+  )
+  run Testing.expect(
+    Pointer.isNullMany<u8>(unsafe sys.sqlite3_column_table_name(statement, 1)),
+    "an expression has no table",
+  )
+  let _finalized = unsafe sys.sqlite3_finalize(statement)
+  let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+effect fn sessions() -> ()
+  ! Failures {
+  let source = open()
+  let target = open()
+  let schema = b"CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"
+  run Testing.expect(execute(source, schema) == sys.SQLITE_OK, "source schema")
+  run Testing.expect(execute(target, schema) == sys.SQLITE_OK, "target schema")
+  let mut session = Pointer.null<u8>()
+  run Testing.expect(
+    unsafe sys.sqlite3session_create(
+      source,
+      text(b"main\0"),
+      Pointer.fromMutRef<?*mut u8>(&mut session),
+    )
+      == sys.SQLITE_OK,
+    "a session starts",
+  )
+  run Testing.expect(
+    unsafe sys.sqlite3session_attach(session, none()) == sys.SQLITE_OK,
+    "attach all",
+  )
+  run Testing.expect(
+    execute(source, b"INSERT INTO t VALUES (1, 'one'), (2, 'two')") == sys.SQLITE_OK,
+    "rows change",
+  )
+  let mut length: i32 = 0
+  let mut changeset = Pointer.null<u8>()
+  run Testing.expect(
+    unsafe sys.sqlite3session_changeset(
+      session,
+      Pointer.fromMutRef<i32>(&mut length),
+      Pointer.fromMutRef<?*mut u8>(&mut changeset),
+    )
+      == sys.SQLITE_OK
+      && length > 0,
+    "the changeset records the inserts",
+  )
+  let applied = unsafe sys.sqlite3changeset_apply(
+    target,
+    length,
+    changeset,
+    Intrinsic.pointerNullFunction<sys.ChangesetFilter>(),
+    omitConflicts,
+    Pointer.null<u8>(),
+  )
+  run Testing.expect(applied == sys.SQLITE_OK, "the changeset applies")
+  unsafe sys.sqlite3_free(changeset)
+  unsafe sys.sqlite3session_delete(session)
+
+  let mut size: i64 = 0
+  let image = unsafe sys.sqlite3_serialize(
+    target,
+    text(b"main\0"),
+    Pointer.fromMutRef<i64>(&mut size),
+    0,
+  )
+  run Testing.expect(!Pointer.isNull<u8>(image) && size > 0, "the target serializes")
+  unsafe sys.sqlite3_free(image)
+
+  let copy = open()
+  let backup = unsafe sys.sqlite3_backup_init(copy, text(b"main\0"), target, text(b"main\0"))
+  run Testing.expect(!Pointer.isNull<u8>(backup), "a backup starts")
+  run Testing.expect(
+    unsafe sys.sqlite3_backup_step(backup, -1) == sys.SQLITE_DONE,
+    "the backup copies every page",
+  )
+  run Testing.expect(
+    unsafe sys.sqlite3_backup_finish(backup) == sys.SQLITE_OK,
+    "the backup finishes",
+  )
+  let _copy = unsafe sys.sqlite3_close_v2(copy)
+  let _source = unsafe sys.sqlite3_close_v2(source)
+  let _target = unsafe sys.sqlite3_close_v2(target)
+}
+
+export "C" fn omitConflicts(data: ?*mut u8, kind: i32, iterator: ?*mut u8) -> i32 {
+  return 0
+}
+
+effect fn extensionLoading() -> ()
+  ! Failures {
+  let db = open()
+  let mut message = Pointer.null<u8>()
+  let code = unsafe sys.sqlite3_load_extension(
+    db,
+    text(b"/nonexistent/silk-sqlite-extension\0"),
+    none(),
+    Pointer.fromMutRef<?*mut u8>(&mut message),
+  )
+  run Testing.expect(code == 1 && !Pointer.isNull<u8>(message), "a missing extension fails to load")
+  unsafe sys.sqlite3_free(message)
+  let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+test effect fn columnMetadataTest() -> ()
+  ! Failures {
+  run columnMetadata()
+}
+
+test effect fn sessionsTest() -> ()
+  ! Failures {
+  run sessions()
+}
+
+test effect fn extensionLoadingTest() -> ()
+  ! Failures {
+  run extensionLoading()
+}
