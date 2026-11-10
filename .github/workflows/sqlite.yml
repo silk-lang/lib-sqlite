@@ -24,6 +24,60 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Tasks are compiled programs; provision their compiler before invoking any task.
+      - name: Bootstrap Linux Clang
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang=$(command -v clang-22)
+          test -x "$clang"
+          echo "SILK_CLANG=$clang" >> "$GITHUB_ENV"
+      - name: Bootstrap macOS Clang and linker
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_UPGRADE: '1'
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
+        run: |
+          set -euo pipefail
+          prefix=$(brew --prefix)
+          test -x "$prefix/opt/llvm@22/bin/clang" || brew install llvm@22
+          test -x "$prefix/opt/lld@22/bin/ld64.lld" || brew install lld@22
+          echo "SILK_CLANG=$prefix/opt/llvm@22/bin/clang" >> "$GITHUB_ENV"
+          echo "$prefix/opt/lld@22/bin" >> "$GITHUB_PATH"
+          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
+      - name: Bootstrap pinned Windows LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lock = Get-Content toolchains.lock.toml -Raw
+          $table = [regex]::Match($lock, '(?ms)^\[llvm\.windows\][ \t]*\r?\n(.*?)(?=^\[|\z)')
+          if (-not $table.Success) { throw 'Missing Windows LLVM lock table.' }
+          $fields = @{}
+          foreach ($name in @('url', 'sha256')) {
+            $field = [regex]::Match($table.Groups[1].Value, "(?m)^$name = `"([^`"]+)`"")
+            if (-not $field.Success) { throw "Missing LLVM $name pin." }
+            $fields[$name] = $field.Groups[1].Value
+          }
+          $size = [regex]::Match($table.Groups[1].Value, '(?m)^bytes = (\d+)')
+          if (-not $size.Success) { throw 'Missing LLVM archive size pin.' }
+          $archive = Join-Path $env:RUNNER_TEMP 'llvm-22.tar.xz'
+          Invoke-WebRequest $fields.url -OutFile $archive
+          if ((Get-Item $archive).Length -ne [long]$size.Groups[1].Value -or
+              (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $fields.sha256) {
+            throw 'LLVM archive verification failed.'
+          }
+          $directory = Join-Path $env:RUNNER_TEMP 'llvm-22'
+          New-Item -ItemType Directory -Force $directory | Out-Null
+          tar -xf $archive -C $directory --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed.' }
+          $clang = Join-Path $directory 'bin/clang.exe'
+          if (-not (Test-Path $clang)) { throw 'LLVM archive contains no bin/clang.exe.' }
+          "SILK_CLANG=$clang" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          (Join-Path $directory 'bin') | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install Silk on Unix
         if: runner.os != 'Windows'
         shell: bash
@@ -34,47 +88,15 @@ jobs:
           version=$(sed -n 's/^silk-version = "\([^"]*\)"/\1/p' silk.toml)
           test -n "$version"
           curl --fail --silent --show-error --location --retry 3 \
-            "https://raw.githubusercontent.com/silk-lang/silk/v${version}/install.sh" \
+            "https://raw.githubusercontent.com/silk-lang/silk/8214c402307b/install.sh" \
             -o "$RUNNER_TEMP/install-silk.sh"
           SILK_RELEASE="v$version" sh "$RUNNER_TEMP/install-silk.sh"
           echo "$HOME/.silk/bin" >> "$GITHUB_PATH"
-      - name: Select Linux Clang
-        if: runner.os == 'Linux'
-        shell: bash
-        run: echo "SILK_CLANG=$(command -v clang-22)" >> "$GITHUB_ENV"
-      - name: Select macOS Clang and SDK
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          brew list llvm >/dev/null 2>&1 || brew install llvm
-          echo "SILK_CLANG=$(brew --prefix llvm)/bin/clang" >> "$GITHUB_ENV"
-          echo "SDKROOT=$(xcrun --sdk macosx --show-sdk-path)" >> "$GITHUB_ENV"
       - name: Configure Windows SDK
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
-          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vs) { throw 'Visual Studio C++ tools not found.' }
-          & "$vs/Common7/Tools/Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
-          foreach ($name in @('INCLUDE', 'LIB', 'LIBPATH', 'PATH')) {
-            "$name=$([Environment]::GetEnvironmentVariable($name))" >> $env:GITHUB_ENV
-          }
-      - name: Install Windows LLVM 22
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $pin = (Get-Content toolchains.lock.json -Raw | ConvertFrom-Json).llvm.windows
-          $archive = Join-Path $env:RUNNER_TEMP 'llvm.tar.xz'
-          Invoke-WebRequest $pin.url -OutFile $archive
-          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $pin.sha256) {
-            throw 'LLVM archive SHA-256 mismatch.'
-          }
-          $directory = Join-Path $env:RUNNER_TEMP 'llvm'
-          New-Item -ItemType Directory -Force $directory | Out-Null
-          tar -xf $archive -C $directory --strip-components=1
-          if ($LASTEXITCODE -ne 0) { throw 'LLVM extraction failed.' }
-          "SILK_CLANG=$directory/bin/clang.exe" >> $env:GITHUB_ENV
+        uses: ilammy/msvc-dev-cmd@a102174a2b586eec2ea151a69e6fd14404a8ce7c # v1.13.0
+        with:
+          arch: amd64
       - name: Install Silk on Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -85,14 +107,14 @@ jobs:
           if (-not $pin) { throw 'Missing Silk version pin.' }
           $version = $pin.Matches[0].Groups[1].Value
           $installer = Join-Path $env:RUNNER_TEMP 'install-silk.ps1'
-          Invoke-WebRequest "https://raw.githubusercontent.com/silk-lang/silk/v$version/install.ps1" -OutFile $installer
+          Invoke-WebRequest "https://raw.githubusercontent.com/silk-lang/silk/8214c402307b/install.ps1" -OutFile $installer
           $env:SILK_RELEASE = "v$version"
           & $installer
           "$HOME/.silk/bin" >> $env:GITHUB_PATH
       - name: Prepare Windows SQLite
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./scripts/prepare-windows.ps1
+        run: silk task --manifest-path tasks.toml prepare-windows
       - run: silk use
       - run: silk format --check
       - run: silk check

@@ -1,0 +1,429 @@
+import silk.cli.command { Command, CommandLine }
+import silk.cli.task { Task, TaskError, TaskSet }
+import silk.collections.bytes { Bytes }
+import silk.collections.list { List }
+import silk.collections.slice { Slice }
+import silk.core.effect { Effect }
+import silk.core.option { Option }
+import silk.core.result { Result }
+import silk.crypto.sha2 { Sha256 }
+import silk.io.writer { WriterError }
+import silk.mem.allocator { Allocator, OutOfMemoryError }
+import silk.platform.windows.path { WindowsPath }
+import silk.system.child_process { ChildProcess, ProcessError }
+import silk.system.filesystem { FileError, FileSystem, Path }
+import silk.system.host_input { HostInput, HostInputError }
+import silk.text.string { InvalidUtf8, Split, String }
+import silk.toml.scanner { TomlError }
+import silk.toml.value { Toml, Value }
+import silk.num.u8
+import silk.num.usize
+
+union Tasks {
+  PrepareWindows,
+}
+
+impl CommandLine for Tasks {
+  static fn command() -> Command<Tasks> {
+    return Command<Tasks>.make("tasks", "SQLite development tasks")
+      |> Command.variant("PrepareWindows", "Build pinned SQLite and its shim with the Windows SDK")
+  }
+}
+
+impl TaskSet for Tasks {
+  effect fn perform(self: Tasks) -> ()
+    ! TaskError | ProcessError | FileError | HostInputError | OutOfMemoryError | WriterError
+    ? &mut HostInput | &mut Allocator | &mut ChildProcess | &mut FileSystem {
+    match move self {
+      Tasks.PrepareWindows => run prepareWindows()
+    }
+  }
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  return run Task.main<Tasks>()
+}
+
+effect fn text(bytes: &[u8]) -> string
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { .. } => run Task.abort("Expected UTF-8 text")
+  }
+}
+
+effect fn environment(name: string) -> String
+  ! TaskError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut Allocator {
+  return match move run HostInput.variableNamed(name) {
+    Option<Bytes>.Some { value } => run String.copy(run text(Bytes.asSlice(&value)))
+    Option<Bytes>.None => String.make()
+  }
+}
+
+effect fn parse(bytes: &[u8]) -> Value
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(Toml.parse(bytes)) {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError _invalid => run Task.abort("Invalid TOML configuration")
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn required(value: Option<&Value>) -> &Value
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move value {
+    Option<&Value>.Some { value: field } => field
+    Option<&Value>.None => run Task.abort("Missing SQLite manifest field")
+  }
+}
+
+effect fn requiredText(value: Option<&Value>) -> string
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move Toml.asString(move value) {
+    Option<string>.Some { value: field } => field
+    Option<string>.None => run Task.abort("Missing SQLite manifest string")
+  }
+}
+
+effect fn nativePath(path: &Path) -> String
+  ! TaskError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = run WindowsPath.toArgumentBytes(path)
+  return run String.copy(run text(Bytes.asSlice(&bytes)))
+}
+
+effect fn copyFile(source: &Path, destination: &Path) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let contents = run FileSystem.readFile(source)
+  run FileSystem.writeFile(destination, Bytes.asSlice(&contents))
+}
+
+effect fn verifyArchive(path: &Path, expected: string) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let contents = run FileSystem.readFile(path)
+  let digest = Sha256.hash(Bytes.asSlice(&contents))
+  let hex = b"0123456789abcdef"
+  let wanted = String.utf8Bytes(expected)
+  if wanted.length != 64 {
+    return false
+  }
+  let mut at: usize = 0
+  while at < 32 {
+    if wanted[at * 2] != hex[u8.toUsize(digest[at] / 16)]
+      || wanted[at * 2 + 1] != hex[u8.toUsize(digest[at] % 16)] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+// Resolve SILK_CLANG like a command, retaining its directory for the matching archiver.
+effect fn clangPath(root: &Path) -> Path
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let mut configured = run environment("SILK_CLANG")
+  if String.view(&configured) == "" {
+    run String.append(&mut configured, "clang.exe")
+  }
+  let name = String.view(&configured)
+  if String.find(name, "/").isSome() || String.find(name, "\\").isSome() {
+    let path = run WindowsPath.resolve(root, name)
+    if !run FileSystem.exists(&path) {
+      run Task.abort("SILK_CLANG does not exist")
+    }
+    return move path
+  }
+  let search = run environment("PATH")
+  let mut directories = String.split(String.view(&search), ";")
+  while let Option<string>.Some { value } = Split.next(&mut directories) {
+    if value == "" {
+      continue
+    }
+    let directory = run WindowsPath.resolve(root, value)
+    let candidate = run Path.join(&directory, name)
+    if run FileSystem.exists(&candidate) {
+      return move candidate
+    }
+    if !String.endsWith(name, ".exe") {
+      let mut executable = run String.copy(name)
+      run String.append(&mut executable, ".exe")
+      let candidate = run Path.join(&directory, String.view(&executable))
+      if run FileSystem.exists(&candidate) {
+        return move candidate
+      }
+    }
+  }
+  return run Task.abort("LLVM clang.exe not found; put LLVM 22 on PATH or set SILK_CLANG")
+}
+
+// Escape the absolute portable path as a TOML basic string without changing other tables.
+effect fn quoted(value: string) -> String
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = run Bytes.copy(b"\"")
+  let bytes = String.utf8Bytes(value)
+  let hex = b"0123456789abcdef"
+  let mut at: usize = 0
+  while at < bytes.length {
+    let byte = bytes[at]
+    if byte == 34 || byte == 92 {
+      run Bytes.append(&mut result, b"\\")
+      run Bytes.append(&mut result, Slice.view(bytes, at, 1))
+    } else if byte < 32 || byte == 127 {
+      let escaped: [u8; 6] = [
+        92,
+        117,
+        48,
+        48,
+        hex[u8.toUsize(byte / 16)],
+        hex[u8.toUsize(byte % 16)],
+      ]
+      run Bytes.append(&mut result, &escaped)
+    } else {
+      run Bytes.append(&mut result, Slice.view(bytes, at, 1))
+    }
+    at = at + 1
+  }
+  run Bytes.append(&mut result, b"\"")
+  return run String.copy(run text(Bytes.asSlice(&result)))
+}
+
+effect fn configureOverride(root: &Path, output: &Path) -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  let configured = run environment("SILK_HOME")
+  let home = if String.view(&configured) != "" {
+    run WindowsPath.resolve(root, String.view(&configured))
+  } else {
+    let user = run environment("USERPROFILE")
+    if String.view(&user) == "" {
+      run Task.abort("Neither SILK_HOME nor USERPROFILE is set")
+    }
+    let directory = run WindowsPath.resolve(root, String.view(&user))
+    run Path.join(&directory, ".silk")
+  }
+  let overrides = run Path.join(&home, "native-overrides.toml")
+  let contents = if run FileSystem.exists(&overrides) {
+    run FileSystem.readFile(&overrides)
+  } else {
+    Bytes.make()
+  }
+  let original = run text(Bytes.asSlice(&contents))
+  let mut updated = String.make()
+  let mut skipping = false
+  let mut lines = String.split(original, "\n")
+  while let Option<string>.Some { value } = Split.next(&mut lines) {
+    let line = String.trim(value)
+    if String.startsWith(line, "[") {
+      skipping = line == "[native.override.sqlite]"
+    }
+    if !skipping {
+      run String.append(&mut updated, value)
+      run String.append(&mut updated, "\n")
+    }
+  }
+  run String.append(&mut updated, "\n[native.override.sqlite]\npath = ")
+  let path = run quoted(run text(Path.rawBytes(output)))
+  run String.append(&mut updated, String.view(&path))
+  run String.append(&mut updated, "\n")
+
+  // Refuse to damage malformed configuration or introduce a duplicate override.
+  drop run parse(String.utf8Bytes(String.view(&updated)))
+  run FileSystem.writeFileWithParents(&overrides, String.utf8Bytes(String.view(&updated)))
+}
+
+effect fn prepareWindows() -> ()
+  ! TaskError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  static if Intrinsic.targetOperatingSystem() != "windows" {
+    run Task.abort("SQLite Windows preparation must run on Windows")
+  }
+  let libraries = run environment("LIB")
+  let includes = run environment("INCLUDE")
+  if String.view(&libraries) == "" || String.view(&includes) == "" {
+    run Task.abort(
+      "Run in an x64 Visual Studio developer environment with the Windows SDK configured",
+    )
+  }
+  let root = run Task.root()
+  let manifestPath = run Path.join(&root, "silk.toml")
+  let manifestBytes = run FileSystem.readFile(&manifestPath)
+  let manifest = run parse(Bytes.asSlice(&manifestBytes))
+  let archive = run required(
+    Toml.field(&manifest, "native")
+      |> Toml.fieldAt("archive")
+      |> Toml.fieldAt("sqlite"),
+  )
+  let url = run requiredText(Toml.field(archive, "url"))
+  let hash = run requiredText(Toml.field(archive, "sha256"))
+  let stripValue = run required(Toml.field(archive, "strip"))
+  let strip = match &stripValue.* {
+    Value.Integer { text } => String.view(&text)
+    _ => run Task.abort("SQLite archive strip must be an integer")
+  }
+  let mut stripFlag = run String.copy("--strip-components=")
+  run String.append(&mut stripFlag, strip)
+  let output = run Path.join(&root, ".cache/sqlite/windows")
+  let source = run Path.join(&output, "source")
+  run FileSystem.createDirectoriesRecursively(&source)
+  let mut archiveName = run String.copy(hash)
+  run String.append(&mut archiveName, ".tar.gz")
+  let cached = run Path.join(&output, String.view(&archiveName))
+  if !run FileSystem.exists(&cached) {
+    run String.append(&mut archiveName, ".download")
+    let download = run Path.join(&output, String.view(&archiveName))
+    let destination = run nativePath(&download)
+    run Task.exec("curl.exe", &["--fail", "--location", "--output", String.view(&destination), url])
+    if !run verifyArchive(&download, hash) {
+      run FileSystem.removeFile(&download)
+      run Task.abort("SQLite archive SHA-256 does not match silk.toml")
+    }
+    run copyFile(&download, &cached)
+    run FileSystem.removeFile(&download)
+  }
+  if !run verifyArchive(&cached, hash) {
+    run Task.abort("Cached SQLite archive is corrupt; remove .cache/sqlite/windows and retry")
+  }
+  let cachedArgument = run nativePath(&cached)
+  let sourceArgument = run nativePath(&source)
+  run Task.exec(
+    "tar.exe",
+    &[
+      "-xf",
+      String.view(&cachedArgument),
+      "-C",
+      String.view(&sourceArgument),
+      String.view(&stripFlag),
+    ],
+  )
+  let sourceNames = ["sqlite3.c", "sqlite3.h"]
+  let mut sourceIndex: usize = 0
+  while sourceIndex < sourceNames.length {
+    let file = run Path.join(&source, sourceNames[sourceIndex])
+    if !run FileSystem.exists(&file) {
+      run Task.abort("SQLite archive is missing sqlite3.c or sqlite3.h")
+    }
+    sourceIndex = sourceIndex + 1
+  }
+  let compiler = run clangPath(&root)
+  let archiver = run Path.resolve(&compiler, "../llvm-lib.exe")
+  if !run FileSystem.exists(&archiver) {
+    run Task.abort("Missing llvm-lib.exe beside clang.exe")
+  }
+  let compilerArgument = run nativePath(&compiler)
+  let archiverArgument = run nativePath(&archiver)
+  let sqlite = run Path.join(&source, "sqlite3.c")
+  let sqliteArgument = run nativePath(&sqlite)
+  let mut arguments = List<string>.make()
+  run List<string>.appendSlice(
+    &mut arguments,
+    &[
+      "--target=x86_64-pc-windows-msvc",
+      "-fms-runtime-lib=dll",
+      "-O2",
+      "-D_CRT_SECURE_NO_WARNINGS",
+      "-w",
+    ],
+  )
+  let sources = run required(Toml.field(&manifest, "native") |> Toml.fieldAt("sources"))
+  let mut at: usize = 0
+  let mut defines: usize = 0
+  while let Option<&Value>.Some { value } = Toml.item(sources, at) {
+    let sourceName = Toml.field(value, "c")
+      |> Toml.asString
+      |> Option<string>.unwrapOr("")
+    if sourceName == "sqlite:sqlite3.c" {
+      let flags = run required(Toml.field(value, "flags"))
+      let mut index: usize = 0
+      while let Option<&Value>.Some { value: flag } = Toml.item(flags, index) {
+        let flagText = run requiredText(Option<&Value>.some(flag))
+        if String.startsWith(flagText, "-D") {
+          run List<string>.append(&mut arguments, flagText)
+          defines = defines + 1
+        }
+        index = index + 1
+      }
+      break
+    }
+    at = at + 1
+  }
+  if defines == 0 {
+    run Task.abort("SQLite source flags contain no feature defines")
+  }
+  run List<string>.appendSlice(
+    &mut arguments,
+    &["-c", String.view(&sqliteArgument), "-o", ".cache/sqlite/windows/sqlite3.obj"],
+  )
+  run Task.exec(String.view(&compilerArgument), List<string>.asSlice(&arguments))
+  run Task.exec(
+    String.view(&compilerArgument),
+    &[
+      "--target=x86_64-pc-windows-msvc",
+      "-fms-runtime-lib=dll",
+      "-O2",
+      "-D_CRT_SECURE_NO_WARNINGS",
+      "-std=c11",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-I",
+      String.view(&sourceArgument),
+      "-c",
+      "native/shim.c",
+      "-o",
+      ".cache/sqlite/windows/shim.obj",
+    ],
+  )
+  let library = run Path.join(&output, "silksqlite.lib")
+  if run FileSystem.exists(&library) {
+    run FileSystem.removeFile(&library)
+  }
+  run Task.exec(
+    String.view(&archiverArgument),
+    &[
+      "/out:.cache/sqlite/windows/silksqlite.lib",
+      ".cache/sqlite/windows/sqlite3.obj",
+      ".cache/sqlite/windows/shim.obj",
+    ],
+  )
+  let libraryNames = ["kernel32.lib", "ucrt.lib", "vcruntime.lib"]
+  let mut libraryIndex: usize = 0
+  while libraryIndex < libraryNames.length {
+    let name = libraryNames[libraryIndex]
+    libraryIndex = libraryIndex + 1
+    let mut found = false
+    let mut directories = String.split(String.view(&libraries), ";")
+    while let Option<string>.Some { value } = Split.next(&mut directories) {
+      if value == "" {
+        continue
+      }
+      let directory = run WindowsPath.resolve(&root, value)
+      let candidate = run Path.join(&directory, name)
+      if run FileSystem.exists(&candidate) {
+        let destination = run Path.join(&output, name)
+        run copyFile(&candidate, &destination)
+        found = true
+        break
+      }
+    }
+    if !found {
+      run Task.abort(
+        "Missing kernel32.lib, ucrt.lib, or vcruntime.lib on LIB; configure the x64 Windows SDK and MSVC tools",
+      )
+    }
+  }
+  run configureOverride(&root, &output)
+}

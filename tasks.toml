@@ -1,0 +1,8 @@
+# Keep provisioning independent of the SQLite native archives it creates.
+[package]
+name = "db-sqlite-tasks"
+version = "0.1.0"
+silk-version = "0.1.0-dev.64+8214c402307b"
+kind = "executable"
+source = "src"
+main = "tasks.silk"

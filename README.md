@@ -85,21 +85,35 @@ macOS, Linux and Windows. macOS and Linux use Silk's native manifest support to 
 compile and cache SQLite automatically. Use LLVM Clang 22; on macOS, set `SDKROOT` to
 `$(xcrun --sdk macosx --show-sdk-path)` if needed. The browser is not supported.
 
-On Windows, run the following from an x64 Visual Studio developer PowerShell 7.2+ with LLVM 22 on
-`PATH` (or `SILK_CLANG` pointing to `clang.exe`):
+On Windows, run the following from an x64 Visual Studio developer environment with LLVM 22 on
+`PATH` (or `SILK_CLANG` pointing to `clang.exe`). Windows-provided `curl.exe` and `tar.exe` are required:
 
 ```powershell
-./scripts/prepare-windows.ps1
+silk task --manifest-path tasks.toml prepare-windows
 silk test --root src/tests.silk
 ```
 
 SQLite needs Windows SDK headers and CRT import libraries that Silk's native compiler invocation
-does not discover. The PowerShell preparation script verifies the pinned source archive, builds
+does not discover. The Silk preparation task verifies the pinned source archive, builds
 SQLite and the shim into `.cache/sqlite/windows/silksqlite.lib`, and copies the required import
 libraries. It sets only the `sqlite` archive override in `$SILK_HOME/native-overrides.toml`
 (`~/.silk` by default), preserving other overrides. Repeat preparation after changing the SQLite
 pin, native flags, shim, or LLVM/SDK installation. Windows consumers run the same preparation from
-a checkout of this repository before building their own package. No Python tooling is required.
+a checkout of this repository before building their own package. No PowerShell or Python script is
+required. The task reads the source URL, SHA-256, archive strip count, and feature defines from
+`silk.toml`; the `sqlite` and `sys` APIs are unchanged.
+
+CI bootstraps Clang 22 and the exact Silk release pinned in `silk.toml` before any task runs,
+because a Silk task is itself compiled. Linux selects the runner's Clang 22; macOS installs only
+missing `llvm@22`/`lld@22` formulae and selects the SDK; Windows checks the byte length and
+SHA-256 of the LLVM release pinned in `toolchains.lock.toml` before extracting it. Windows CI
+configures the x64 Visual Studio environment, then runs `prepare-windows`. Homebrew provisioning
+never requests the unversioned `llvm` formula or upgrades an already installed compiler.
+
+Use the standalone `tasks.toml` manifest for `prepare-windows`. The library manifest's native inputs
+also apply to its tasks profile, so using it for preparation would require the SQLite archives
+before they exist. The standalone manifest builds `src/tasks.silk` without SQLite or its native
+compiler requirements, while keeping the repository root as the task's working directory.
 
 ## Tests
 

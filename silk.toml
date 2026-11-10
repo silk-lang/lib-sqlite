@@ -4,14 +4,14 @@ description = "SQLite bindings with prepared statements and transactions, built 
 repository = "https://github.com/silk-lang/lib-sqlite"
 readme = "README.md"
 version = "0.1.0"
-silk-version = "0.1.0-dev.61+91f335268900"
+silk-version = "0.1.0-dev.64+8214c402307b"
 kind = "library"
 exports = ["sqlite", "sys"]
 
 # SQLite's amalgamation (one C file) is fetched from sqlite.org, pinned by hash, and compiled into
 # every executable that depends on this package, together with the small shim in native/. On
-# Windows it needs the Windows SDK, which Silk does not pass to Clang, so scripts/prepare-windows.ps1
-# builds both into silksqlite.lib and names that directory, with the
+# Windows it needs the Windows SDK, which Silk does not pass to Clang, so the prepare-windows task
+# (`silk task --manifest-path tasks.toml prepare-windows`) builds both into silksqlite.lib and names that directory, with the
 # CRT import libraries a `library` entry does not reach, as this archive's override.
 [native]
 sources = [

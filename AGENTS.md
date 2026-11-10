@@ -1,9 +1,10 @@
 # Development
 
 Use Silk's toolchain and native manifest support for builds, formatting, tests, and documentation.
-Use build hooks when the manifest cannot express a build step. Do not use Python scripts unless
-the Silk toolchain and hooks are insufficient. Windows SDK preparation lives in
-`scripts/prepare-windows.ps1`.
+Use build hooks when the manifest cannot express a build step. Repository automation belongs in
+`src/tasks.silk`; use `silk task --manifest-path tasks.toml prepare-windows` for Windows SQLite
+preparation. CI provisions Clang 22 before any task, because tasks are compiled programs.
+The standalone task manifest avoids requiring the library's native inputs before provisioning.
 
 ```sh
 silk use
