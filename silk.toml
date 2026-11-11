@@ -4,7 +4,7 @@ description = "SQLite bindings with prepared statements and transactions, built 
 repository = "https://github.com/silk-lang/lib-sqlite"
 readme = "README.md"
 version = "0.1.0"
-silk-version = "0.1.0-dev.65+9f3441fd4a2e"
+silk-version = "0.1.0-dev.68+c11c7e82c2ab"
 kind = "library"
 exports = ["sqlite", "sys"]
 
