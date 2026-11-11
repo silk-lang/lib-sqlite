@@ -2,7 +2,7 @@
 [package]
 name = "db-sqlite-tasks"
 version = "0.1.0"
-silk-version = "0.1.0-dev.68+c11c7e82c2ab"
+silk-version = "0.1.0-dev.69+366225ca4dc5"
 kind = "executable"
 source = "src"
 main = "tasks.silk"
