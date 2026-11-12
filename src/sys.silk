@@ -78,6 +78,19 @@ pub type ChangesetConflict = extern "C" fn(?*mut u8, i32, ?*mut u8) -> i32
 pub type Authorizer =
   ?extern "C" fn(?*mut u8, i32, ?[*]const u8, ?[*]const u8, ?[*]const u8, ?[*]const u8,) -> i32
 
+/// The `sqlite3_trace_v2` callback: the event (one `SQLITE_TRACE_*` bit), the user data and two
+/// event arguments. For `SQLITE_TRACE_PROFILE` they are the statement and a pointer to its
+/// estimated run time in nanoseconds (an `i64`). The return value is ignored.
+pub type TraceCallback = ?extern "C" fn(u32, ?*mut u8, ?*mut u8, ?*mut u8) -> i32
+
+pub const SQLITE_TRACE_STMT: u32 = 0x01
+
+pub const SQLITE_TRACE_PROFILE: u32 = 0x02
+
+pub const SQLITE_TRACE_ROW: u32 = 0x04
+
+pub const SQLITE_TRACE_CLOSE: u32 = 0x08
+
 pub unsafe extern "C" fn silk_sqlite_open(
   path: ?[*]const u8,
   length: usize,
@@ -334,6 +347,15 @@ pub unsafe extern "C" fn sqlite3_result_error(
 ) -> ()
 
 pub unsafe extern "C" fn sqlite3_result_error_nomem(context: ?*mut u8) -> ()
+
+// A zero `mask` with a null `callback` turns tracing off.
+@deferredCallbacks("callback")
+pub unsafe extern "C" fn sqlite3_trace_v2(
+  db: ?*mut u8,
+  mask: u32,
+  callback: TraceCallback,
+  data: ?*mut u8,
+) -> i32
 
 @deferredCallbacks("callback")
 pub unsafe extern "C" fn sqlite3_set_authorizer(
