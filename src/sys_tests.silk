@@ -1,5 +1,6 @@
 //! Tests of the raw `sys` bindings for what the safe API does not wrap: column metadata, the
-//! session extension, serialization, backups and extension loading. They check that the package
+//! session extension, serialization, backups, extension loading, tracing and the optional virtual
+//! tables and functions (FTS3/4, Geopoly, dbstat, percentile). They check that the package
 //! builds SQLite with those features.
 import silk.mem.allocator { OutOfMemoryError }
 import silk.mem.pointer { Pointer }
@@ -180,6 +181,79 @@ effect fn extensionLoading() -> ()
   run Testing.expect(code == 1 && !Pointer.isNull<u8>(message), "a missing extension fails to load")
   unsafe sys.sqlite3_free(message)
   let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+// Counts SQLITE_TRACE_PROFILE events into the i32 the user data points at.
+export "C" fn countProfiles(
+  event: u32,
+  data: ?*mut u8,
+  statement: ?*mut u8,
+  detail: ?*mut u8,
+) -> i32 {
+  if event != sys.SQLITE_TRACE_PROFILE || Pointer.isNull<u8>(data) {
+    return 0
+  }
+  let counter = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut i32>(
+    unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(data),
+  )
+  unsafe Pointer.put<i32>(counter, unsafe Pointer.read<i32>(counter) + 1)
+  return 0
+}
+
+effect fn tracing() -> ()
+  ! Failures {
+  let db = open()
+  let mut profiles: i32 = 0
+  let data = unsafe Intrinsic.pointerReinterpret<*mut i32, *mut u8>(
+    Pointer.fromMutRef<i32>(&mut profiles),
+  )
+  run Testing.expect(
+    unsafe sys.sqlite3_trace_v2(db, sys.SQLITE_TRACE_PROFILE, countProfiles, data) == sys.SQLITE_OK,
+    "tracing starts",
+  )
+  run Testing.expect(execute(db, b"SELECT 1; SELECT 2") == sys.SQLITE_OK, "two statements run")
+  run Testing.expect(profiles == 2, "each statement reports its run time")
+  run Testing.expect(
+    unsafe sys.sqlite3_trace_v2(
+      db,
+      0,
+      Intrinsic.pointerNullFunction<sys.TraceCallback>(),
+      Pointer.null<u8>(),
+    )
+      == sys.SQLITE_OK,
+    "tracing stops",
+  )
+  run Testing.expect(execute(db, b"SELECT 3") == sys.SQLITE_OK, "a statement runs")
+  run Testing.expect(profiles == 2, "nothing is reported once tracing stops")
+  let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+effect fn optionalFeatures() -> ()
+  ! Failures {
+  let db = open()
+  run Testing.expect(execute(db, b"CREATE VIRTUAL TABLE a USING fts3(x)") == sys.SQLITE_OK, "fts3")
+  run Testing.expect(execute(db, b"CREATE VIRTUAL TABLE b USING fts4(x)") == sys.SQLITE_OK, "fts4")
+  run Testing.expect(
+    execute(db, b"SELECT * FROM a WHERE a MATCH '(x OR y) AND z'") == sys.SQLITE_OK,
+    "fts3 parenthesis syntax",
+  )
+  run Testing.expect(
+    execute(db, b"CREATE VIRTUAL TABLE g USING geopoly()") == sys.SQLITE_OK,
+    "geopoly",
+  )
+  run Testing.expect(execute(db, b"SELECT * FROM dbstat") == sys.SQLITE_OK, "dbstat")
+  run Testing.expect(execute(db, b"SELECT percentile(1, 50)") == sys.SQLITE_OK, "percentile")
+  let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+test effect fn tracingTest() -> ()
+  ! Failures {
+  run tracing()
+}
+
+test effect fn optionalFeaturesTest() -> ()
+  ! Failures {
+  run optionalFeatures()
 }
 
 test effect fn columnMetadataTest() -> ()

@@ -4,7 +4,7 @@ description = "SQLite bindings with prepared statements and transactions, built 
 repository = "https://github.com/silk-lang/lib-sqlite"
 readme = "README.md"
 version = "0.1.0"
-silk-version = "0.1.0-dev.64+8214c402307b"
+silk-version = "0.1.0-dev.69+366225ca4dc5"
 kind = "library"
 exports = ["sqlite", "sys"]
 
@@ -15,7 +15,7 @@ exports = ["sqlite", "sys"]
 # CRT import libraries a `library` entry does not reach, as this archive's override.
 [native]
 sources = [
-  { c = "sqlite:sqlite3.c", flags = ["-O2", "-w", "-DSQLITE_DQS=0", "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1", "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS", "-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_OMIT_SHARED_CACHE", "-DSQLITE_USE_ALLOCA", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_MATH_FUNCTIONS", "-DSQLITE_ENABLE_RTREE", "-DSQLITE_ENABLE_SESSION", "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_COLUMN_METADATA"], os = ["macos", "linux"] },
+  { c = "sqlite:sqlite3.c", flags = ["-O2", "-w", "-DSQLITE_DQS=0", "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1", "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS", "-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_OMIT_SHARED_CACHE", "-DSQLITE_USE_ALLOCA", "-DSQLITE_ENABLE_COLUMN_METADATA", "-DSQLITE_ENABLE_DBSTAT_VTAB", "-DSQLITE_ENABLE_FTS3", "-DSQLITE_ENABLE_FTS3_PARENTHESIS", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_GEOPOLY", "-DSQLITE_ENABLE_MATH_FUNCTIONS", "-DSQLITE_ENABLE_PERCENTILE", "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_RBU", "-DSQLITE_ENABLE_RTREE", "-DSQLITE_ENABLE_SESSION"], os = ["macos", "linux"] },
   { c = "native/shim.c", include = ["sqlite:"], flags = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"], os = ["macos", "linux"] },
 ]
 link = [
