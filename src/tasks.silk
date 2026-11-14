@@ -325,15 +325,13 @@ effect fn prepareWindows() -> ()
   }
   let compilerArgument = run nativePath(&compiler)
   let archiverArgument = run nativePath(&archiver)
-  let sqlite = run Path.join(&source, "sqlite3.c")
-  let sqliteArgument = run nativePath(&sqlite)
   let mut arguments = List<string>.make()
   run List<string>.appendSlice(
     &mut arguments,
     &[
       "--target=x86_64-pc-windows-msvc",
       "-fms-runtime-lib=dll",
-      "-O2",
+      "-O3",
       "-D_CRT_SECURE_NO_WARNINGS",
       "-w",
     ],
@@ -345,7 +343,7 @@ effect fn prepareWindows() -> ()
     let sourceName = Toml.field(value, "c")
       |> Toml.asString
       |> Option<string>.unwrapOr("")
-    if sourceName == "sqlite:sqlite3.c" {
+    if sourceName == "native/sqlite.c" {
       let flags = run required(Toml.field(value, "flags"))
       let mut index: usize = 0
       while let Option<&Value>.Some { value: flag } = Toml.item(flags, index) {
@@ -365,7 +363,14 @@ effect fn prepareWindows() -> ()
   }
   run List<string>.appendSlice(
     &mut arguments,
-    &["-c", String.view(&sqliteArgument), "-o", ".cache/sqlite/windows/sqlite3.obj"],
+    &[
+      "-I",
+      String.view(&sourceArgument),
+      "-c",
+      "native/sqlite.c",
+      "-o",
+      ".cache/sqlite/windows/sqlite3.obj",
+    ],
   )
   run Task.exec(String.view(&compilerArgument), List<string>.asSlice(&arguments))
   run Task.exec(
