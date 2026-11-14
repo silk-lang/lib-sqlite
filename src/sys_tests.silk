@@ -270,3 +270,80 @@ test effect fn extensionLoadingTest() -> ()
   ! Failures {
   run extensionLoading()
 }
+
+// silk_sqlite_row reads a row as the sqlite3_column_* accessors do.
+effect fn rowRead() -> ()
+  ! Failures {
+  let db = open()
+  run Testing.expect(!Pointer.isNull<u8>(db), "an in-memory database opens")
+  let sql = b"SELECT 42, 1.5, 'abc', 'h\xc3\xa9', x'0102', NULL, 9007199254740993"
+  let mut statement = Pointer.null<u8>()
+  let code = unsafe sys.sqlite3_prepare_v2(
+    db,
+    Pointer.fromSlice<u8>(sql),
+    usize.toI32(sql.length),
+    Pointer.fromMutRef<?*mut u8>(&mut statement),
+    Pointer.null<?[*]const u8>(),
+  )
+  run Testing.expect(code == sys.SQLITE_OK, "the query compiles")
+  let mut integers: [i64; 7] = [0; 7]
+  let mut reals: [f64; 7] = [0.0; 7]
+  let mut data: [?[*]const u8; 7] = [none(); 7]
+  let mut meta: [i32; 14] = [0; 14]
+  run Testing.expect(
+    unsafe sys.silk_sqlite_row(
+      statement,
+      1,
+      Pointer.fromMutRef<i64>(&mut integers[0]),
+      Pointer.fromMutRef<f64>(&mut reals[0]),
+      Pointer.fromMutRef<?[*]const u8>(&mut data[0]),
+      Pointer.fromMutRef<i32>(&mut meta[0]),
+    )
+      == sys.SQLITE_MISUSE,
+    "no row before the first step",
+  )
+  run Testing.expect(unsafe sys.sqlite3_step(statement) == sys.SQLITE_ROW, "one row")
+  run Testing.expect(
+    unsafe sys.silk_sqlite_row(
+      statement,
+      8,
+      Pointer.fromMutRef<i64>(&mut integers[0]),
+      Pointer.fromMutRef<f64>(&mut reals[0]),
+      Pointer.fromMutRef<?[*]const u8>(&mut data[0]),
+      Pointer.fromMutRef<i32>(&mut meta[0]),
+    )
+      == sys.SQLITE_MISUSE,
+    "more columns than the row has",
+  )
+  run Testing.expect(
+    unsafe sys.silk_sqlite_row(
+      statement,
+      7,
+      Pointer.fromMutRef<i64>(&mut integers[0]),
+      Pointer.fromMutRef<f64>(&mut reals[0]),
+      Pointer.fromMutRef<?[*]const u8>(&mut data[0]),
+      Pointer.fromMutRef<i32>(&mut meta[0]),
+    )
+      == sys.SQLITE_OK,
+    "the row reads",
+  )
+  run Testing.expect(meta[0] == sys.SQLITE_INTEGER && integers[0] == 42, "integer")
+  run Testing.expect(meta[2] == sys.SQLITE_FLOAT && reals[1] == 1.5, "double")
+  run Testing.expect(meta[4] == (sys.SQLITE_TEXT | 0x100) && meta[5] == 3, "ASCII text")
+  run Testing.expect(same(data[2], b"abc"), "text bytes")
+  run Testing.expect(meta[6] == sys.SQLITE_TEXT && meta[7] == 3, "UTF-8 text is not ASCII")
+  run Testing.expect(meta[8] == sys.SQLITE_BLOB && meta[9] == 2, "blob")
+  run Testing.expect(meta[10] == sys.SQLITE_NULL && meta[11] == 0, "null")
+  run Testing.expect(
+    meta[12] == sys.SQLITE_INTEGER && integers[6] == 9007199254740993,
+    "wide integer",
+  )
+  run Testing.expect(unsafe sys.sqlite3_step(statement) == sys.SQLITE_DONE, "done")
+  let _finalized = unsafe sys.sqlite3_finalize(statement)
+  let _closed = unsafe sys.sqlite3_close_v2(db)
+}
+
+test effect fn rowReadTest() -> ()
+  ! Failures {
+  run rowRead()
+}
