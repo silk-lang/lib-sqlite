@@ -350,6 +350,17 @@ effect fn prepareWindows() -> ()
   }
   let compilerArgument = run nativePath(&compiler)
   let archiverArgument = run nativePath(&archiver)
+
+  // Absolute paths for the compiler and archiver: Clang on the Windows runners cannot open a
+  // relative output path ("invalid argument"). They outlive `arguments`, which borrows them.
+  let sqliteSource = run Path.join(&root, "native/sqlite.c")
+  let shimSource = run Path.join(&root, "native/shim.c")
+  let sqliteObject = run Path.join(&output, "sqlite3.obj")
+  let shimObject = run Path.join(&output, "shim.obj")
+  let sqliteSourceArgument = run nativePath(&sqliteSource)
+  let shimSourceArgument = run nativePath(&shimSource)
+  let sqliteObjectArgument = run nativePath(&sqliteObject)
+  let shimObjectArgument = run nativePath(&shimObject)
   let mut arguments = List<string>.make()
   run List<string>.appendSlice(
     &mut arguments,
@@ -362,16 +373,6 @@ effect fn prepareWindows() -> ()
     ],
   )
 
-  // Absolute paths for the compiler and archiver: Clang on the Windows runners cannot open a
-  // relative output path ("invalid argument").
-  let sqliteSource = run Path.join(&root, "native/sqlite.c")
-  let shimSource = run Path.join(&root, "native/shim.c")
-  let sqliteObject = run Path.join(&output, "sqlite3.obj")
-  let shimObject = run Path.join(&output, "shim.obj")
-  let sqliteSourceArgument = run nativePath(&sqliteSource)
-  let shimSourceArgument = run nativePath(&shimSource)
-  let sqliteObjectArgument = run nativePath(&sqliteObject)
-  let shimObjectArgument = run nativePath(&shimObject)
   run List<string>.appendSlice(&mut arguments, &FEATURES)
   run List<string>.appendSlice(
     &mut arguments,
