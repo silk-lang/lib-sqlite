@@ -88,7 +88,7 @@ jobs:
           version=$(sed -n 's/^silk-version = "\([^"]*\)"/\1/p' silk.toml)
           test -n "$version"
           curl --fail --silent --show-error --location --retry 3 \
-            "https://raw.githubusercontent.com/silk-lang/silk/v0.1.0-pipeline.1/install.sh" \
+            "https://raw.githubusercontent.com/silk-lang/silk/bf7450df2216/install.sh" \
             -o "$RUNNER_TEMP/install-silk.sh"
           SILK_RELEASE="v$version" sh "$RUNNER_TEMP/install-silk.sh"
           echo "$HOME/.silk/bin" >> "$GITHUB_PATH"
@@ -107,7 +107,7 @@ jobs:
           if (-not $pin) { throw 'Missing Silk version pin.' }
           $version = $pin.Matches[0].Groups[1].Value
           $installer = Join-Path $env:RUNNER_TEMP 'install-silk.ps1'
-          Invoke-WebRequest "https://raw.githubusercontent.com/silk-lang/silk/v0.1.0-pipeline.1/install.ps1" -OutFile $installer
+          Invoke-WebRequest "https://raw.githubusercontent.com/silk-lang/silk/bf7450df2216/install.ps1" -OutFile $installer
           $env:SILK_RELEASE = "v$version"
           & $installer
           "$HOME/.silk/bin" >> $env:GITHUB_PATH
