@@ -1,0 +1,71 @@
+import silk.build.plan { Library, Plan }
+import silk.build.step { sourcePath }
+
+static fn plan() -> Plan {
+  let mut plan = Plan.empty()
+  if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    plan = plan
+      |> Plan.compileNative(
+        "c",
+        sourcePath("native/sqlite.c"),
+        &[
+          "-O3",
+          "-w",
+          "-DSQLITE_DQS=0",
+          "-DSQLITE_THREADSAFE=1",
+          "-DSQLITE_DEFAULT_MEMSTATUS=0",
+          "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+          "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+          "-DSQLITE_OMIT_DEPRECATED",
+          "-DSQLITE_OMIT_SHARED_CACHE",
+          "-DSQLITE_USE_ALLOCA",
+          "-DSQLITE_ENABLE_COLUMN_METADATA",
+          "-DSQLITE_ENABLE_DBSTAT_VTAB",
+          "-DSQLITE_ENABLE_FTS3",
+          "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
+          "-DSQLITE_ENABLE_FTS5",
+          "-DSQLITE_ENABLE_GEOPOLY",
+          "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+          "-DSQLITE_ENABLE_PERCENTILE",
+          "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+          "-DSQLITE_ENABLE_RBU",
+          "-DSQLITE_ENABLE_RTREE",
+          "-DSQLITE_ENABLE_SESSION",
+        ],
+        &[Plan.archivePath("sqlite", "")],
+      )
+  }
+  if Intrinsic.targetOperatingSystem() == "darwin" || Intrinsic.targetOperatingSystem() == "linux" {
+    plan = plan
+      |> Plan.compileNative(
+        "c",
+        sourcePath("native/shim.c"),
+        &["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"],
+        &[Plan.archivePath("sqlite", "")],
+      )
+  }
+  if Intrinsic.targetOperatingSystem() == "linux" {
+    plan = plan |> Plan.linkLibrary("m", Library.dynamicSearch())
+  }
+  if Intrinsic.targetOperatingSystem() == "linux" {
+    plan = plan |> Plan.linkLibrary("pthread", Library.dynamicSearch())
+  }
+  if Intrinsic.targetOperatingSystem() == "linux" {
+    plan = plan |> Plan.linkLibrary("dl", Library.dynamicSearch())
+  }
+  if Intrinsic.targetOperatingSystem() == "windows" {
+    plan = plan |> Plan.linkArchive(Plan.archivePath("sqlite", "silksqlite.lib"))
+  }
+  if Intrinsic.targetOperatingSystem() == "windows" {
+    plan = plan |> Plan.linkArchive(Plan.archivePath("sqlite", "kernel32.lib"))
+  }
+  if Intrinsic.targetOperatingSystem() == "windows" {
+    plan = plan |> Plan.linkArchive(Plan.archivePath("sqlite", "ucrt.lib"))
+  }
+  if Intrinsic.targetOperatingSystem() == "windows" {
+    plan = plan |> Plan.linkArchive(Plan.archivePath("sqlite", "vcruntime.lib"))
+  }
+  return plan
+}
+
+pub const PLAN: Plan = plan()

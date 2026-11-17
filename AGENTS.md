@@ -1,7 +1,7 @@
 # Development
 
-Use Silk's toolchain and native manifest support for builds, formatting, tests, and documentation.
-Use build hooks when the manifest cannot express a build step. Repository automation belongs in
+Use Silk's toolchain and typed build plans for builds, formatting, tests, and documentation.
+Repository automation belongs in
 `src/tasks.silk`; use `silk task --manifest-path tasks.toml prepare-windows` for Windows SQLite
 preparation. CI provisions Clang 22 before any task, because tasks are compiled programs.
 The standalone task manifest avoids requiring the library's native inputs before provisioning.
@@ -16,7 +16,7 @@ silk doc -o build/doc.json
 ```
 
 Keep the `db-sqlite` package name and `sqlite` / `sys` exports compatible with existing consumers.
-SQLite's source URL, SHA-256, and feature flags are pinned in `silk.toml`.
+SQLite's source URL and SHA-256 are pinned in `silk.toml`; `build.silk` declares its feature flags and native inputs.
 
 <!-- codebase-memory-mcp:start -->
 # Codebase Knowledge Graph (codebase-memory-mcp)

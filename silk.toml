@@ -4,7 +4,7 @@ description = "SQLite bindings with prepared statements and transactions, built 
 repository = "https://github.com/silk-lang/lib-sqlite"
 readme = "README.md"
 version = "0.1.0"
-silk-version = "0.1.0-dev.74+205aea3f5b2e"
+silk-version = "0.1.0-dev.86+c9d19330761b"
 kind = "library"
 exports = ["sqlite", "sys"]
 
@@ -13,21 +13,6 @@ exports = ["sqlite", "sys"]
 # Windows it needs the Windows SDK, which Silk does not pass to Clang, so the prepare-windows task
 # (`silk task --manifest-path tasks.toml prepare-windows`) builds both into silksqlite.lib and names that directory, with the
 # CRT import libraries a `library` entry does not reach, as this archive's override.
-[native]
-sources = [
-  { c = "native/sqlite.c", include = ["sqlite:"], flags = ["-O3", "-w", "-DSQLITE_DQS=0", "-DSQLITE_THREADSAFE=1", "-DSQLITE_DEFAULT_MEMSTATUS=0", "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1", "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS", "-DSQLITE_OMIT_DEPRECATED", "-DSQLITE_OMIT_SHARED_CACHE", "-DSQLITE_USE_ALLOCA", "-DSQLITE_ENABLE_COLUMN_METADATA", "-DSQLITE_ENABLE_DBSTAT_VTAB", "-DSQLITE_ENABLE_FTS3", "-DSQLITE_ENABLE_FTS3_PARENTHESIS", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_GEOPOLY", "-DSQLITE_ENABLE_MATH_FUNCTIONS", "-DSQLITE_ENABLE_PERCENTILE", "-DSQLITE_ENABLE_PREUPDATE_HOOK", "-DSQLITE_ENABLE_RBU", "-DSQLITE_ENABLE_RTREE", "-DSQLITE_ENABLE_SESSION"], os = ["macos", "linux"] },
-  { c = "native/shim.c", include = ["sqlite:"], flags = ["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"], os = ["macos", "linux"] },
-]
-link = [
-  { library = "m", mode = "dynamic", os = "linux" },
-  { library = "pthread", mode = "dynamic", os = "linux" },
-  { library = "dl", mode = "dynamic", os = "linux" },
-  { static-archive = "sqlite:silksqlite.lib", os = "windows" },
-  { static-archive = "sqlite:kernel32.lib", os = "windows" },
-  { static-archive = "sqlite:ucrt.lib", os = "windows" },
-  { static-archive = "sqlite:vcruntime.lib", os = "windows" },
-]
-
 [native.archive.sqlite]
 url = "https://www.sqlite.org/2026/sqlite-autoconf-3540100.tar.gz"
 sha256 = "926ef8d3eab93fbf6e06011901273eec076b25594a4e1cdadd50c987f4f6d64e"

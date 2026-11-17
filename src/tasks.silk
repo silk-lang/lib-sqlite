@@ -19,6 +19,31 @@ import silk.toml.value { Toml, Value }
 import silk.num.u8
 import silk.num.usize
 
+/// SQLite's feature defines. Keep in step with the `native/sqlite.c` entry in `build.silk`, which
+/// a tasks program cannot import.
+const FEATURES: [string; 20] = [
+  "-DSQLITE_DQS=0",
+  "-DSQLITE_THREADSAFE=1",
+  "-DSQLITE_DEFAULT_MEMSTATUS=0",
+  "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+  "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+  "-DSQLITE_OMIT_DEPRECATED",
+  "-DSQLITE_OMIT_SHARED_CACHE",
+  "-DSQLITE_USE_ALLOCA",
+  "-DSQLITE_ENABLE_COLUMN_METADATA",
+  "-DSQLITE_ENABLE_DBSTAT_VTAB",
+  "-DSQLITE_ENABLE_FTS3",
+  "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
+  "-DSQLITE_ENABLE_FTS5",
+  "-DSQLITE_ENABLE_GEOPOLY",
+  "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+  "-DSQLITE_ENABLE_PERCENTILE",
+  "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+  "-DSQLITE_ENABLE_RBU",
+  "-DSQLITE_ENABLE_RTREE",
+  "-DSQLITE_ENABLE_SESSION",
+]
+
 union Tasks {
   PrepareWindows,
 }
@@ -102,6 +127,37 @@ effect fn nativePath(path: &Path) -> String
   return run String.copy(run text(Bytes.asSlice(&bytes)))
 }
 
+// The native argument for `fragment` below `base`, naming the file when that fails.
+effect fn argumentBelow(base: &Path, fragment: string) -> String
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(joinedArgument(base, fragment)) {
+    Result<String, TaskError | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<String, TaskError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      TaskError failed => {
+        fail move failed
+      }
+      FileError invalid => {
+        drop invalid
+        let mut message = run String.copy("Cannot name ")
+        run String.append(&mut message, fragment)
+        run String.append(&mut message, " as an absolute Windows path")
+        fail TaskError { message: move message, status: 1 }
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn joinedArgument(base: &Path, fragment: string) -> String
+  ! TaskError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let path = run Path.join(base, fragment)
+  return run nativePath(&path)
+}
+
 effect fn copyFile(source: &Path, destination: &Path) -> ()
   ! FileError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
@@ -130,6 +186,29 @@ effect fn verifyArchive(path: &Path, expected: string) -> bool
   return true
 }
 
+// `entry` of a `;` list such as `LIB` or `PATH` with each run of separators made one, as Windows
+// reads it, past the leading `\\` of a share. The Visual Studio developer shell writes
+// `Windows Kits\10\\lib\...\\um\x64` into `LIB`, which `WindowsPath.resolve` refuses for its
+// empty components.
+effect fn collapsed(entry: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(entry)
+  let mut result = String.make()
+  let mut at: usize = 0
+  let mut start: usize = 0
+  while at < bytes.length {
+    let separator = bytes[at] == 92 || bytes[at] == 47
+    if separator && at > 1 && (bytes[at - 1] == 92 || bytes[at - 1] == 47) {
+      run String.append(&mut result, String.slice(entry, start, at - start))
+      start = at + 1
+    }
+    at = at + 1
+  }
+  run String.append(&mut result, String.slice(entry, start, bytes.length - start))
+  return move result
+}
+
 // Resolve SILK_CLANG like a command, retaining its directory for the matching archiver.
 effect fn clangPath(root: &Path) -> Path
   ! TaskError | FileError | HostInputError | OutOfMemoryError
@@ -152,7 +231,8 @@ effect fn clangPath(root: &Path) -> Path
     if value == "" {
       continue
     }
-    let directory = run WindowsPath.resolve(root, value)
+    let listed = run collapsed(value)
+    let directory = run WindowsPath.resolve(root, String.view(&listed))
     let candidate = run Path.join(&directory, name)
     if run FileSystem.exists(&candidate) {
       return move candidate
@@ -325,6 +405,13 @@ effect fn prepareWindows() -> ()
   }
   let compilerArgument = run nativePath(&compiler)
   let archiverArgument = run nativePath(&archiver)
+
+  // Absolute paths for the compiler and archiver: Clang on the Windows runners cannot open a
+  // relative output path ("invalid argument"). They outlive `arguments`, which borrows them.
+  let sqliteSourceArgument = run argumentBelow(&root, "native/sqlite.c")
+  let shimSourceArgument = run argumentBelow(&root, "native/shim.c")
+  let sqliteObjectArgument = run argumentBelow(&output, "sqlite3.obj")
+  let shimObjectArgument = run argumentBelow(&output, "shim.obj")
   let mut arguments = List<string>.make()
   run List<string>.appendSlice(
     &mut arguments,
@@ -336,40 +423,17 @@ effect fn prepareWindows() -> ()
       "-w",
     ],
   )
-  let sources = run required(Toml.field(&manifest, "native") |> Toml.fieldAt("sources"))
-  let mut at: usize = 0
-  let mut defines: usize = 0
-  while let Option<&Value>.Some { value } = Toml.item(sources, at) {
-    let sourceName = Toml.field(value, "c")
-      |> Toml.asString
-      |> Option<string>.unwrapOr("")
-    if sourceName == "native/sqlite.c" {
-      let flags = run required(Toml.field(value, "flags"))
-      let mut index: usize = 0
-      while let Option<&Value>.Some { value: flag } = Toml.item(flags, index) {
-        let flagText = run requiredText(Option<&Value>.some(flag))
-        if String.startsWith(flagText, "-D") {
-          run List<string>.append(&mut arguments, flagText)
-          defines = defines + 1
-        }
-        index = index + 1
-      }
-      break
-    }
-    at = at + 1
-  }
-  if defines == 0 {
-    run Task.abort("SQLite source flags contain no feature defines")
-  }
+
+  run List<string>.appendSlice(&mut arguments, &FEATURES)
   run List<string>.appendSlice(
     &mut arguments,
     &[
       "-I",
       String.view(&sourceArgument),
       "-c",
-      "native/sqlite.c",
+      String.view(&sqliteSourceArgument),
       "-o",
-      ".cache/sqlite/windows/sqlite3.obj",
+      String.view(&sqliteObjectArgument),
     ],
   )
   run Task.exec(String.view(&compilerArgument), List<string>.asSlice(&arguments))
@@ -387,22 +451,21 @@ effect fn prepareWindows() -> ()
       "-I",
       String.view(&sourceArgument),
       "-c",
-      "native/shim.c",
+      String.view(&shimSourceArgument),
       "-o",
-      ".cache/sqlite/windows/shim.obj",
+      String.view(&shimObjectArgument),
     ],
   )
   let library = run Path.join(&output, "silksqlite.lib")
   if run FileSystem.exists(&library) {
     run FileSystem.removeFile(&library)
   }
+  let libraryArgument = run nativePath(&library)
+  let mut outFlag = run String.copy("/out:")
+  run String.append(&mut outFlag, String.view(&libraryArgument))
   run Task.exec(
     String.view(&archiverArgument),
-    &[
-      "/out:.cache/sqlite/windows/silksqlite.lib",
-      ".cache/sqlite/windows/sqlite3.obj",
-      ".cache/sqlite/windows/shim.obj",
-    ],
+    &[String.view(&outFlag), String.view(&sqliteObjectArgument), String.view(&shimObjectArgument)],
   )
   let libraryNames = ["kernel32.lib", "ucrt.lib", "vcruntime.lib"]
   let mut libraryIndex: usize = 0
@@ -415,7 +478,8 @@ effect fn prepareWindows() -> ()
       if value == "" {
         continue
       }
-      let directory = run WindowsPath.resolve(&root, value)
+      let listed = run collapsed(value)
+      let directory = run WindowsPath.resolve(&root, String.view(&listed))
       let candidate = run Path.join(&directory, name)
       if run FileSystem.exists(&candidate) {
         let destination = run Path.join(&output, name)
