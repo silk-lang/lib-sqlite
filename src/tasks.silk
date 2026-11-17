@@ -186,6 +186,29 @@ effect fn verifyArchive(path: &Path, expected: string) -> bool
   return true
 }
 
+// `entry` of a `;` list such as `LIB` or `PATH` with each run of separators made one, as Windows
+// reads it, past the leading `\\` of a share. The Visual Studio developer shell writes
+// `Windows Kits\10\\lib\...\\um\x64` into `LIB`, which `WindowsPath.resolve` refuses for its
+// empty components.
+effect fn collapsed(entry: string) -> String
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let bytes = String.utf8Bytes(entry)
+  let mut result = String.make()
+  let mut at: usize = 0
+  let mut start: usize = 0
+  while at < bytes.length {
+    let separator = bytes[at] == 92 || bytes[at] == 47
+    if separator && at > 1 && (bytes[at - 1] == 92 || bytes[at - 1] == 47) {
+      run String.append(&mut result, String.slice(entry, start, at - start))
+      start = at + 1
+    }
+    at = at + 1
+  }
+  run String.append(&mut result, String.slice(entry, start, bytes.length - start))
+  return move result
+}
+
 // Resolve SILK_CLANG like a command, retaining its directory for the matching archiver.
 effect fn clangPath(root: &Path) -> Path
   ! TaskError | FileError | HostInputError | OutOfMemoryError
@@ -208,7 +231,8 @@ effect fn clangPath(root: &Path) -> Path
     if value == "" {
       continue
     }
-    let directory = run WindowsPath.resolve(root, value)
+    let listed = run collapsed(value)
+    let directory = run WindowsPath.resolve(root, String.view(&listed))
     let candidate = run Path.join(&directory, name)
     if run FileSystem.exists(&candidate) {
       return move candidate
@@ -454,7 +478,8 @@ effect fn prepareWindows() -> ()
       if value == "" {
         continue
       }
-      let directory = run WindowsPath.resolve(&root, value)
+      let listed = run collapsed(value)
+      let directory = run WindowsPath.resolve(&root, String.view(&listed))
       let candidate = run Path.join(&directory, name)
       if run FileSystem.exists(&candidate) {
         let destination = run Path.join(&output, name)
