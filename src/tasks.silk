@@ -127,6 +127,37 @@ effect fn nativePath(path: &Path) -> String
   return run String.copy(run text(Bytes.asSlice(&bytes)))
 }
 
+// The native argument for `fragment` below `base`, naming the file when that fails.
+effect fn argumentBelow(base: &Path, fragment: string) -> String
+  ! TaskError | OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(joinedArgument(base, fragment)) {
+    Result<String, TaskError | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<String, TaskError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      TaskError failed => {
+        fail move failed
+      }
+      FileError invalid => {
+        drop invalid
+        let mut message = run String.copy("Cannot name ")
+        run String.append(&mut message, fragment)
+        run String.append(&mut message, " as an absolute Windows path")
+        fail TaskError { message: move message, status: 1 }
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+effect fn joinedArgument(base: &Path, fragment: string) -> String
+  ! TaskError | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let path = run Path.join(base, fragment)
+  return run nativePath(&path)
+}
+
 effect fn copyFile(source: &Path, destination: &Path) -> ()
   ! FileError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
@@ -353,14 +384,10 @@ effect fn prepareWindows() -> ()
 
   // Absolute paths for the compiler and archiver: Clang on the Windows runners cannot open a
   // relative output path ("invalid argument"). They outlive `arguments`, which borrows them.
-  let sqliteSource = run Path.join(&root, "native/sqlite.c")
-  let shimSource = run Path.join(&root, "native/shim.c")
-  let sqliteObject = run Path.join(&output, "sqlite3.obj")
-  let shimObject = run Path.join(&output, "shim.obj")
-  let sqliteSourceArgument = run nativePath(&sqliteSource)
-  let shimSourceArgument = run nativePath(&shimSource)
-  let sqliteObjectArgument = run nativePath(&sqliteObject)
-  let shimObjectArgument = run nativePath(&shimObject)
+  let sqliteSourceArgument = run argumentBelow(&root, "native/sqlite.c")
+  let shimSourceArgument = run argumentBelow(&root, "native/shim.c")
+  let sqliteObjectArgument = run argumentBelow(&output, "sqlite3.obj")
+  let shimObjectArgument = run argumentBelow(&output, "shim.obj")
   let mut arguments = List<string>.make()
   run List<string>.appendSlice(
     &mut arguments,
