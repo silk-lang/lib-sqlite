@@ -19,6 +19,31 @@ import silk.toml.value { Toml, Value }
 import silk.num.u8
 import silk.num.usize
 
+/// SQLite's feature defines. Keep in step with the `native/sqlite.c` entry in `build.silk`, which
+/// a tasks program cannot import.
+const FEATURES: [string; 20] = [
+  "-DSQLITE_DQS=0",
+  "-DSQLITE_THREADSAFE=1",
+  "-DSQLITE_DEFAULT_MEMSTATUS=0",
+  "-DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1",
+  "-DSQLITE_LIKE_DOESNT_MATCH_BLOBS",
+  "-DSQLITE_OMIT_DEPRECATED",
+  "-DSQLITE_OMIT_SHARED_CACHE",
+  "-DSQLITE_USE_ALLOCA",
+  "-DSQLITE_ENABLE_COLUMN_METADATA",
+  "-DSQLITE_ENABLE_DBSTAT_VTAB",
+  "-DSQLITE_ENABLE_FTS3",
+  "-DSQLITE_ENABLE_FTS3_PARENTHESIS",
+  "-DSQLITE_ENABLE_FTS5",
+  "-DSQLITE_ENABLE_GEOPOLY",
+  "-DSQLITE_ENABLE_MATH_FUNCTIONS",
+  "-DSQLITE_ENABLE_PERCENTILE",
+  "-DSQLITE_ENABLE_PREUPDATE_HOOK",
+  "-DSQLITE_ENABLE_RBU",
+  "-DSQLITE_ENABLE_RTREE",
+  "-DSQLITE_ENABLE_SESSION",
+]
+
 union Tasks {
   PrepareWindows,
 }
@@ -336,31 +361,7 @@ effect fn prepareWindows() -> ()
       "-w",
     ],
   )
-  let sources = run required(Toml.field(&manifest, "native") |> Toml.fieldAt("sources"))
-  let mut at: usize = 0
-  let mut defines: usize = 0
-  while let Option<&Value>.Some { value } = Toml.item(sources, at) {
-    let sourceName = Toml.field(value, "c")
-      |> Toml.asString
-      |> Option<string>.unwrapOr("")
-    if sourceName == "native/sqlite.c" {
-      let flags = run required(Toml.field(value, "flags"))
-      let mut index: usize = 0
-      while let Option<&Value>.Some { value: flag } = Toml.item(flags, index) {
-        let flagText = run requiredText(Option<&Value>.some(flag))
-        if String.startsWith(flagText, "-D") {
-          run List<string>.append(&mut arguments, flagText)
-          defines = defines + 1
-        }
-        index = index + 1
-      }
-      break
-    }
-    at = at + 1
-  }
-  if defines == 0 {
-    run Task.abort("SQLite source flags contain no feature defines")
-  }
+  run List<string>.appendSlice(&mut arguments, &FEATURES)
   run List<string>.appendSlice(
     &mut arguments,
     &[
